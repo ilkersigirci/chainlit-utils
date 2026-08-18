@@ -6,6 +6,7 @@ import pytest
 
 from chainlit_utils import database
 from chainlit_utils.database import ChainlitMigrationError, Migration
+from chainlit_utils.settings import Settings
 
 
 class FakeTransaction:
@@ -141,9 +142,12 @@ async def test_migration_table_name_is_validated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        database.settings,
-        "MIGRATIONS_TABLE",
-        'history; DROP TABLE "Thread"',
+        database,
+        "settings",
+        Settings(
+            _env_file=None,
+            MIGRATIONS_TABLE='history; DROP TABLE "Thread"',
+        ),
     )
 
     with pytest.raises(ValueError, match="Invalid PostgreSQL"):

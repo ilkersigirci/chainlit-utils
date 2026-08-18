@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from chainlit_utils import chat
+from chainlit_utils.settings import Settings
 
 
 @pytest.mark.anyio
@@ -93,7 +94,11 @@ async def test_custom_metadata_key_preserves_existing_threads(
     init_http_context()
     chat.cl.chat_context.clear()
     legacy_key = "my_app.exclude_from_model_context"
-    monkeypatch.setattr(chat.settings, "MODEL_CONTEXT_EXCLUDED_KEY", legacy_key)
+    monkeypatch.setattr(
+        chat,
+        "settings",
+        Settings(_env_file=None, MODEL_CONTEXT_EXCLUDED_KEY=legacy_key),
+    )
     thread = cast(
         ThreadDict,
         {

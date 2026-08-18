@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="CHAINLIT_UTILS_",
         extra="ignore",
+        frozen=True,
     )
 
     MIGRATIONS_TABLE: str = Field(
