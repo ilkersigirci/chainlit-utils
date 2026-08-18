@@ -8,10 +8,9 @@ class Settings(BaseSettings):
     """Configuration shared by the reusable Chainlit helpers."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
         env_prefix="CHAINLIT_UTILS_",
-        env_file_encoding="utf-8",
         extra="ignore",
+        frozen=True,
     )
 
     MIGRATIONS_TABLE: str = Field(
