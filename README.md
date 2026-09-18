@@ -150,27 +150,35 @@ profile must have spontaneous uploads enabled.
 
 ## Human-in-the-loop Responses
 
-`chainlit_utils.openai.hitl` validates and serializes an exact Responses
-function-call batch, then builds the matching `function_call_output` batch.
-`chainlit_utils.chat.hitl` persists that continuation in a model-context-excluded
+`chainlit_utils.openai.hitl` validates and serializes exact Responses function-call
+batches. `HitlWorkflow` persists the continuation in a model-context-excluded
 Chainlit message, restores it after reconnect, and drives sequential pauses.
 
-Create one codec for the application-owned HITL tool name:
+Configure one workflow with the application-owned tool name and four small
+callbacks:
 
 ```python
-from chainlit_utils.openai.hitl import HitlLedgerCodec
+from chainlit_utils.chat.hitl import HitlWorkflow
 
-hitl_codec = HitlLedgerCodec("human_review")
+hitl = HitlWorkflow(
+    "human_review",
+    ask=ask_for_output,
+    continue_response=continue_response,
+    prompt=prompt_for_calls,
+    publish_final=publish_final,
+    element_name="HumanReview",
+)
 ```
 
-Pass the codec to `persist_pending_hitl`, `complete_pending_hitl`, and
-`restore_pending_hitl`. Use `resolve_hitl` with application callbacks that ask
-for one output per call, continue with the supplied `previous_response_id`, and
-publish that Response. The callback owns storage policy and the actual API
-request. OpenAI continuations by ID require a stored prior Response; stateless
-client-tool loops instead use `continuation_input` to replay every output item
-in order. The application continues to own the tool definition and payload
-schema, the review UI, and client credentials.
+Call `await hitl.run(response, model_id=model_id)` when that tool appears,
+`await hitl.restore(thread)` from `on_chat_resume`, and
+`await hitl.continue_pending(message)` before starting a new request. Call
+`hitl.cancel()` from `on_chat_end` so a disconnected live prompt does not remain
+active. The callbacks own the API request, final rendering, tool payload schema,
+review UI, and client credentials.
+
+OpenAI continuations by ID require a stored prior Response. Stateless client-tool
+loops instead use `continuation_input` to replay every output item in order.
 
 The ledger is strict and versioned. It rejects unknown fields, unexpected tool
 names, duplicate call IDs, and incomplete output batches instead of guessing at
