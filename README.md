@@ -174,8 +174,11 @@ Call `await hitl.run(response, model_id=model_id)` when that tool appears,
 `await hitl.restore(thread)` from `on_chat_resume`, and
 `await hitl.continue_pending(message)` before starting a new request. Call
 `hitl.cancel()` from `on_chat_end` so a disconnected live prompt does not remain
-active. The callbacks own the API request, final rendering, tool payload schema,
-review UI, and client credentials.
+active. It cancels only the task currently waiting for HITL input; ordinary
+responses and accepted continuations keep running. If background work produces
+another interrupt while disconnected, the workflow persists it and defers the
+prompt until the thread resumes. The callbacks own the API request, final
+rendering, tool payload schema, review UI, and client credentials.
 
 OpenAI continuations by ID require a stored prior Response. Stateless client-tool
 loops instead use `continuation_input` to replay every output item in order.

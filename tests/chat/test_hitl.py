@@ -62,6 +62,20 @@ def recording_message(
     return message
 
 
+def install_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    socket_id: str = "socket-one",
+) -> SimpleNamespace:
+    session = SimpleNamespace(socket_id=socket_id)
+    monkeypatch.setattr(
+        hitl,
+        "chainlit_context",
+        SimpleNamespace(session=session),
+    )
+    return session
+
+
 def install_chainlit(
     monkeypatch: pytest.MonkeyPatch,
     message: SimpleNamespace,
@@ -77,6 +91,7 @@ def install_chainlit(
             set=session.__setitem__,
         ),
     )
+    install_context(monkeypatch)
     return session
 
 
@@ -389,9 +404,250 @@ async def test_workflow_keeps_the_pending_ledger_when_prompt_is_cancelled(
     assert isinstance(session[hitl.PENDING_HITL_SESSION_KEY], hitl.PendingHitl)
 
 
+async def test_workflow_cancel_ignores_an_unrelated_chat_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = install_chainlit(monkeypatch, recording_message([]))
+    chat_task = Mock(done=Mock(return_value=False), cancel=Mock())
+    monkeypatch.setattr(
+        hitl,
+        "chainlit_context",
+        SimpleNamespace(
+            session=SimpleNamespace(
+                current_task=chat_task,
+                socket_id="socket-one",
+            )
+        ),
+    )
+    workflow = hitl.HitlWorkflow(
+        TOOL_NAME,
+        ask=AsyncMock(),
+        continue_response=AsyncMock(),
+        prompt=Mock(),
+        publish_final=AsyncMock(),
+    )
+
+    workflow.cancel()
+
+    assert hitl.PENDING_HITL_SESSION_KEY not in session
+    chat_task.cancel.assert_not_called()
+
+
+async def test_workflow_cancel_stops_only_the_active_hitl_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt_started = asyncio.Event()
+
+    async def wait_for_input(*_args: object) -> str:
+        prompt_started.set()
+        await asyncio.Future()
+        return "unreachable"
+
+    session = install_chainlit(monkeypatch, recording_message([]))
+    chainlit_session = SimpleNamespace(socket_id="socket-one", to_clear=False)
+    monkeypatch.setattr(
+        hitl,
+        "chainlit_context",
+        SimpleNamespace(session=chainlit_session),
+    )
+    pending_response = Response.model_construct(
+        id="resp_one",
+        status="completed",
+        output=[function_call("one")],
+    )
+    workflow = hitl.HitlWorkflow(
+        TOOL_NAME,
+        ask=wait_for_input,
+        continue_response=AsyncMock(),
+        prompt=Mock(return_value="Approve one?"),
+        publish_final=AsyncMock(),
+    )
+    hitl_task = asyncio.create_task(
+        workflow.run(pending_response, model_id="review-model")
+    )
+    await prompt_started.wait()
+
+    workflow.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await hitl_task
+    assert isinstance(session[hitl.PENDING_HITL_SESSION_KEY], hitl.PendingHitl)
+
+
+async def test_workflow_defers_an_interrupt_produced_after_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[tuple[str, dict[str, object] | None]] = []
+    session = install_chainlit(monkeypatch, recording_message(writes))
+    monkeypatch.setattr(
+        hitl,
+        "chainlit_context",
+        SimpleNamespace(session=SimpleNamespace(socket_id="socket-one", to_clear=True)),
+    )
+    pending_response = Response.model_construct(
+        id="resp_one",
+        status="completed",
+        output=[function_call("one")],
+    )
+    ask = AsyncMock(return_value="approve")
+    workflow = hitl.HitlWorkflow(
+        TOOL_NAME,
+        ask=ask,
+        continue_response=AsyncMock(),
+        prompt=Mock(return_value="Approve one?"),
+        publish_final=AsyncMock(),
+    )
+
+    workflow.cancel()
+    session.clear()  # Chainlit clears user_session when navigating to another thread.
+    await workflow.run(pending_response, model_id="review-model")
+
+    assert session == {}
+    assert writes[0][1][hitl.HITL_LEDGER_METADATA_KEY]["response_id"] == "resp_one"
+    ask.assert_not_awaited()
+
+
+async def test_workflow_recognizes_a_reconnected_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_chainlit(monkeypatch, recording_message([]))
+    chainlit_session = SimpleNamespace(socket_id="socket-one")
+    monkeypatch.setattr(
+        hitl,
+        "chainlit_context",
+        SimpleNamespace(session=chainlit_session),
+    )
+    pending_response = Response.model_construct(
+        id="resp_one",
+        status="completed",
+        output=[function_call("one")],
+    )
+    ask = AsyncMock(return_value=None)
+    workflow = hitl.HitlWorkflow(
+        TOOL_NAME,
+        ask=ask,
+        continue_response=AsyncMock(),
+        prompt=Mock(return_value="Approve one?"),
+        publish_final=AsyncMock(),
+    )
+
+    workflow.cancel()
+    chainlit_session.socket_id = "socket-two"
+    await workflow.run(pending_response, model_id="review-model")
+
+    ask.assert_awaited_once()
+
+
+async def test_workflow_finishes_an_accepted_continuation_after_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    continuation_started = asyncio.Event()
+    release_continuation = asyncio.Event()
+    final = Response.model_construct(
+        id="resp_final",
+        status="completed",
+        output=[],
+    )
+
+    async def continue_response(*_args: object, **_kwargs: object) -> Response:
+        continuation_started.set()
+        await release_continuation.wait()
+        return final
+
+    session = install_chainlit(monkeypatch, recording_message([]))
+    chainlit_session = SimpleNamespace(socket_id="socket-one", to_clear=False)
+    monkeypatch.setattr(
+        hitl,
+        "chainlit_context",
+        SimpleNamespace(session=chainlit_session),
+    )
+    pending_response = Response.model_construct(
+        id="resp_one",
+        status="completed",
+        output=[function_call("one")],
+    )
+    publish_final = AsyncMock()
+    workflow = hitl.HitlWorkflow(
+        TOOL_NAME,
+        ask=AsyncMock(return_value="approve"),
+        continue_response=continue_response,
+        prompt=Mock(return_value="Approve one?"),
+        publish_final=publish_final,
+    )
+    workflow_task = asyncio.create_task(
+        workflow.run(pending_response, model_id="review-model")
+    )
+    await continuation_started.wait()
+
+    chainlit_session.to_clear = True
+    workflow.cancel()
+    session.clear()
+    await asyncio.sleep(0)
+
+    assert not workflow_task.done()
+    release_continuation.set()
+    await workflow_task
+    assert session == {}
+    publish_final.assert_awaited_once_with(final)
+
+
+async def test_workflow_defers_a_later_interrupt_after_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    continuation_started = asyncio.Event()
+    release_continuation = asyncio.Event()
+    next_pending_response = Response.model_construct(
+        id="resp_two",
+        status="completed",
+        output=[function_call("two")],
+    )
+
+    async def continue_response(*_args: object, **_kwargs: object) -> Response:
+        continuation_started.set()
+        await release_continuation.wait()
+        return next_pending_response
+
+    writes: list[tuple[str, dict[str, object] | None]] = []
+    session = install_chainlit(monkeypatch, recording_message(writes))
+    chainlit_session = SimpleNamespace(socket_id="socket-one", to_clear=False)
+    monkeypatch.setattr(
+        hitl,
+        "chainlit_context",
+        SimpleNamespace(session=chainlit_session),
+    )
+    first_pending_response = Response.model_construct(
+        id="resp_one",
+        status="completed",
+        output=[function_call("one")],
+    )
+    ask = AsyncMock(return_value="approve")
+    workflow = hitl.HitlWorkflow(
+        TOOL_NAME,
+        ask=ask,
+        continue_response=continue_response,
+        prompt=lambda calls: f"Review {calls[0].call_id}",
+        publish_final=AsyncMock(),
+    )
+    workflow_task = asyncio.create_task(
+        workflow.run(first_pending_response, model_id="review-model")
+    )
+    await continuation_started.wait()
+
+    chainlit_session.to_clear = True
+    workflow.cancel()
+    session.clear()
+    release_continuation.set()
+    await workflow_task
+
+    assert session == {}
+    assert writes[-1][1][hitl.HITL_LEDGER_METADATA_KEY]["response_id"] == "resp_two"
+    assert ask.await_count == 1
+
+
 async def test_workflow_restores_the_prompt_after_thread_hydration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    install_context(monkeypatch)
     codec = HitlLedgerCodec(TOOL_NAME)
     ledger = codec.pending_metadata(
         codec.continuation(
@@ -447,6 +703,7 @@ async def test_workflow_restores_the_prompt_after_thread_hydration(
 async def test_workflow_reports_an_unsupported_persisted_ledger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    install_context(monkeypatch)
     codec = HitlLedgerCodec(TOOL_NAME)
     ledger = codec.pending_metadata(
         codec.continuation(
@@ -491,6 +748,7 @@ async def test_workflow_reports_an_unsupported_persisted_ledger(
 async def test_workflow_reopens_pending_review_instead_of_starting_a_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    install_context(monkeypatch)
     pending = continuation(HitlLedgerCodec(TOOL_NAME), "one", response_id="resp_one")
     session = {hitl.PENDING_HITL_SESSION_KEY: pending}
     monkeypatch.setattr(

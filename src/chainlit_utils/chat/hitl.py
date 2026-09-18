@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 HITL_LEDGER_METADATA_KEY = "chainlit_utils.hitl_ledger"
 PENDING_HITL_SESSION_KEY = "chainlit_utils.pending_hitl"
+_LIVE_HITL_STATE_ATTRIBUTE = "_chainlit_utils_live_hitl_state"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +49,14 @@ class _PendingLedgerEntry:
 
     step: Mapping[str, object]
     continuation: HitlContinuation
+
+
+@dataclass(slots=True)
+class _LiveHitlState:
+    """Ephemeral HITL state owned by one live Chainlit WebSocket session."""
+
+    disconnected_socket_id: str | None = None
+    prompt_task: asyncio.Task[Any] | None = None
 
 
 class _ContinueResponse(Protocol):
@@ -109,6 +118,7 @@ class HitlWorkflow:
         pending = cl.user_session.get(PENDING_HITL_SESSION_KEY)
         if not isinstance(pending, PendingHitl):
             return False
+        self._mark_connected()
         if trigger_message is not None:
             mark_model_context_excluded(trigger_message)
             await trigger_message.update()
@@ -121,6 +131,8 @@ class HitlWorkflow:
     async def restore(self, thread: ThreadDict) -> None:
         """Restore and reopen the newest pending workflow after thread hydration."""
         mark_persisted_errors_excluded(thread)
+        self._mark_connected()
+        self._live_state().prompt_task = None
         cl.user_session.set(PENDING_HITL_SESSION_KEY, None)
         try:
             pending = restore_pending_hitl(thread, codec=self._codec)
@@ -144,18 +156,75 @@ class HitlWorkflow:
 
     @staticmethod
     def cancel() -> None:
-        """Cancel the live prompt; its durable ledger remains restorable."""
-        task = chainlit_context.session.current_task
-        if task is not None and task is not asyncio.current_task() and not task.done():
+        """Record the disconnect and cancel only its live HITL prompt."""
+        state = HitlWorkflow._live_state()
+        socket_id = getattr(chainlit_context.session, "socket_id", None)
+        if isinstance(socket_id, str):
+            state.disconnected_socket_id = socket_id
+
+        task = state.prompt_task
+        if (
+            isinstance(task, asyncio.Task)
+            and task is not asyncio.current_task()
+            and not task.done()
+        ):
             task.cancel()
 
     async def _resolve(self, pending: PendingHitl) -> None:
         await resolve_hitl(
             pending,
-            ask=self._ask,
+            ask=self._ask_while_connected,
             continue_response=self._continue_response,
             publish_response=self._publish_response,
         )
+
+    async def _ask_while_connected(
+        self,
+        call: ResponseFunctionToolCall,
+        ledger_message: cl.Message,
+    ) -> str | None:
+        if self._is_disconnected():
+            return None
+
+        task = asyncio.current_task()
+        if task is None:
+            return await self._ask(call, ledger_message)
+
+        state = self._live_state()
+        state.prompt_task = task
+        try:
+            return await self._ask(call, ledger_message)
+        finally:
+            if state.prompt_task is task:
+                state.prompt_task = None
+
+    @staticmethod
+    def _is_disconnected() -> bool:
+        state = HitlWorkflow._live_state()
+        if state.disconnected_socket_id is None:
+            return False
+        current_socket = getattr(chainlit_context.session, "socket_id", None)
+        return state.disconnected_socket_id == current_socket
+
+    @staticmethod
+    def _mark_connected() -> None:
+        HitlWorkflow._live_state().disconnected_socket_id = None
+
+    @staticmethod
+    def _live_state() -> _LiveHitlState:
+        # Chainlit clears user_session on thread navigation while the old task can
+        # still finish, so live ownership must remain on the referenced session.
+        session = chainlit_context.session
+        state = getattr(session, _LIVE_HITL_STATE_ATTRIBUTE, None)
+        if not isinstance(state, _LiveHitlState):
+            state = _LiveHitlState()
+            setattr(session, _LIVE_HITL_STATE_ATTRIBUTE, state)
+        return state
+
+    @staticmethod
+    def _session_will_clear() -> bool:
+        # Do not recreate a deleted user_session merely to cache durable state.
+        return getattr(chainlit_context.session, "to_clear", False) is True
 
     async def _publish_response(
         self,
@@ -174,9 +243,14 @@ class HitlWorkflow:
                 response_id=response.id,
                 function_calls=calls,
                 prompt=self._prompt(calls),
+                store_in_session=not self._session_will_clear(),
             )
         if ledger_message is not None:
-            await complete_pending_hitl(ledger_message, codec=self._codec)
+            await complete_pending_hitl(
+                ledger_message,
+                codec=self._codec,
+                store_in_session=not self._session_will_clear(),
+            )
         await self._publish_final(response)
         return None
 
@@ -240,6 +314,7 @@ async def persist_pending_hitl(
     prompt: str,
     metadata_key: str = HITL_LEDGER_METADATA_KEY,
     session_key: str = PENDING_HITL_SESSION_KEY,
+    store_in_session: bool = True,
 ) -> PendingHitl:
     """Persist the exact continuation before an application solicits input."""
     continuation = codec.continuation(
@@ -258,7 +333,8 @@ async def persist_pending_hitl(
         await ledger_message.update()
 
     pending = PendingHitl(message=ledger_message, continuation=continuation)
-    cl.user_session.set(session_key, pending)
+    if store_in_session:
+        cl.user_session.set(session_key, pending)
     return pending
 
 
@@ -268,6 +344,7 @@ async def complete_pending_hitl(
     codec: HitlLedgerCodec,
     metadata_key: str = HITL_LEDGER_METADATA_KEY,
     session_key: str = PENDING_HITL_SESSION_KEY,
+    store_in_session: bool = True,
 ) -> None:
     """Persist completion before rendering output so resume cannot replay."""
     _set_ledger_metadata(
@@ -276,7 +353,8 @@ async def complete_pending_hitl(
         metadata_key=metadata_key,
     )
     await ledger_message.update()
-    cl.user_session.set(session_key, None)
+    if store_in_session:
+        cl.user_session.set(session_key, None)
 
 
 def _newest_pending_ledger(
