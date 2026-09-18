@@ -16,7 +16,7 @@ def chainlit_app_root(
     monkeypatch.setenv("CHAINLIT_APP_ROOT", str(tmp_path))
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
 

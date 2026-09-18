@@ -1,6 +1,6 @@
 import pytest
 
-from chainlit_utils.chat_settings import (
+from chainlit_utils.chat.settings import (
     SettingsSerializationError,
     serialize_settings,
     settings_widgets,

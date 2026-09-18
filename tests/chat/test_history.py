@@ -4,29 +4,27 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from chainlit_utils import chat
+from chainlit_utils.chat import history
 from chainlit_utils.settings import Settings
 
 
-@pytest.mark.anyio
 async def test_send_ui_message_marks_it_outside_model_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     message = Mock(metadata={"existing": "value"}, send=AsyncMock())
     factory = Mock(return_value=message)
-    monkeypatch.setattr(chat.cl, "Message", factory)
+    monkeypatch.setattr(history.cl, "Message", factory)
 
-    await chat.send_ui_message("Diagnostic")
+    await history.send_ui_message("Diagnostic")
 
     factory.assert_called_once_with(content="Diagnostic")
     assert message.metadata == {
         "existing": "value",
-        chat.settings.MODEL_CONTEXT_EXCLUDED_KEY: True,
+        history.settings.MODEL_CONTEXT_EXCLUDED_KEY: True,
     }
     message.send.assert_awaited_once_with()
 
 
-@pytest.mark.anyio
 async def test_text_only_chat_messages_uses_native_context(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -35,19 +33,20 @@ async def test_text_only_chat_messages_uses_native_context(
     from chainlit.context import init_http_context
 
     init_http_context()
-    chat.cl.chat_context.clear()
-    chat.cl.user_session.set("messages", [])
-    chat.cl.chat_context.add(chat.cl.Message(content="Hello", type="user_message"))
-    chat.cl.chat_context.add(chat.cl.Message(content="Hello!"))
+    history.cl.chat_context.clear()
+    history.cl.user_session.set("messages", [])
+    history.cl.chat_context.add(
+        history.cl.Message(content="Hello", type="user_message")
+    )
+    history.cl.chat_context.add(history.cl.Message(content="Hello!"))
 
-    assert chat.text_only_chat_messages() == [
+    assert history.text_only_chat_messages() == [
         {"role": "user", "content": "Hello"},
         {"role": "assistant", "content": "Hello!"},
     ]
-    assert chat.cl.user_session.get("messages") == []
+    assert history.cl.user_session.get("messages") == []
 
 
-@pytest.mark.anyio
 async def test_text_only_chat_message_policy(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -56,33 +55,38 @@ async def test_text_only_chat_message_policy(
     from chainlit.context import init_http_context
 
     init_http_context()
-    chat.cl.chat_context.clear()
+    history.cl.chat_context.clear()
 
     included_messages = [
-        chat.cl.Message(content="User turn", type="user_message"),
-        chat.cl.Message(content="Model turn"),
+        history.cl.Message(content="User turn", type="user_message"),
+        history.cl.Message(content="Model turn"),
+        history.cl.Message(content="Task manually stopped."),
     ]
     excluded_messages = [
-        chat.cl.Message(content="Partial assistant output"),
-        chat.cl.AskActionMessage(content="Approve?", actions=[]),
+        history.cl.Message(content="Partial assistant output"),
+        history.cl.AskActionMessage(content="Approve?", actions=[]),
+        history.cl.AskElementMessage(
+            content="Approve?",
+            element=history.cl.CustomElement(name="Review", props={}),
+        ),
     ]
     for message in excluded_messages:
-        chat.mark_model_context_excluded(message)
+        history.mark_model_context_excluded(message)
 
     for message in [
         *included_messages,
         *excluded_messages,
-        chat.cl.ErrorMessage(content="Chainlit callback failed"),
+        history.cl.ErrorMessage(content="Chainlit callback failed"),
     ]:
-        chat.cl.chat_context.add(message)
+        history.cl.chat_context.add(message)
 
-    assert chat.text_only_chat_messages() == [
+    assert history.text_only_chat_messages() == [
         {"role": "user", "content": "User turn"},
         {"role": "assistant", "content": "Model turn"},
+        {"role": "assistant", "content": "Task manually stopped."},
     ]
 
 
-@pytest.mark.anyio
 async def test_custom_metadata_key_preserves_existing_threads(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -92,10 +96,10 @@ async def test_custom_metadata_key_preserves_existing_threads(
     from chainlit.types import ThreadDict
 
     init_http_context()
-    chat.cl.chat_context.clear()
+    history.cl.chat_context.clear()
     legacy_key = "my_app.exclude_from_model_context"
     monkeypatch.setattr(
-        chat,
+        history,
         "settings",
         Settings(_env_file=None, MODEL_CONTEXT_EXCLUDED_KEY=legacy_key),
     )
@@ -123,14 +127,14 @@ async def test_custom_metadata_key_preserves_existing_threads(
         },
     )
 
-    chat.mark_persisted_errors_excluded(thread)
+    history.mark_persisted_errors_excluded(thread)
     for step in thread["steps"]:
-        chat.cl.chat_context.add(chat.cl.Message.from_dict(step))
+        history.cl.chat_context.add(history.cl.Message.from_dict(step))
 
     assert thread["steps"][0]["metadata"] == {
         "existing": "value",
         legacy_key: True,
     }
-    assert chat.text_only_chat_messages() == [
+    assert history.text_only_chat_messages() == [
         {"role": "assistant", "content": "Valid turn"}
     ]

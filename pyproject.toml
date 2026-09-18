@@ -1,30 +1,39 @@
 [project]
 name = "chainlit-utils"
 version = "0.1.0"
-description = "Reusable persistence and chat helpers for Chainlit applications"
+description = "Reusable chat, OpenAI, MCP, OAuth, and persistence integrations for Chainlit"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11,<3.15"
+requires-python = ">=3.11,<3.14"
 authors = [
     { name = "İlker SIĞIRCI", email = "sigirci.ilker@gmail.com" },
 ]
 dependencies = [
     "asyncpg>=0.30.0",
-    "chainlit>=2.11.1",
-    "openai>=2.0.0",
+    "chainlit>=2.12.0,<3",
+    "mcp>=1.0,<2",
+    "openai>=3.14.1,<4",
+    "pydantic>=2.11,<3",
     "pydantic-settings>=2.9.0",
 ]
 
+[project.optional-dependencies]
+sso = [
+    "authlib>=1.8,<2",
+    "itsdangerous>=2.2,<3",
+]
+
 [project.scripts]
-chainlit-utils-migrate = "chainlit_utils.database:main"
+chainlit-utils-migrate = "chainlit_utils.db.schema:main"
 
 [dependency-groups]
 dev = [
     "ruff>=0.15.12",
+    "ty>=0.0.72",
 ]
 test = [
-    "anyio>=4",
+    "anyio>=4.14,<5",
     "pytest>=8.3.3",
 ]
 
@@ -34,12 +43,15 @@ required-version = ">=0.12.1"
 
 [tool.pytest.ini_options]
 minversion = "8.3.3"
+anyio_mode = "auto"
 addopts = [
     "--import-mode=importlib",
     "--color=yes",
     "--strict-config",
     "--strict-markers",
+    "-m", "not integration",
 ]
+markers = ["integration: requires PostgreSQL via TEST_CHAINLIT_DATABASE_URL"]
 testpaths = ["tests"]
 
 [tool.ruff]

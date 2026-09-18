@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from chainlit_utils import database
-from chainlit_utils.database import ChainlitMigrationError, Migration
+from chainlit_utils.db import schema
+from chainlit_utils.db.schema import ChainlitMigrationError, Migration
 from chainlit_utils.settings import Settings
 
 
@@ -57,7 +57,7 @@ def test_load_migrations_orders_and_checksums_sql(tmp_path: Path) -> None:
     first = tmp_path / "0001_first.sql"
     first.write_text("SELECT 1;", encoding="utf-8")
 
-    loaded = database.load_migrations(tmp_path)
+    loaded = schema.load_migrations(tmp_path)
 
     assert [item.version for item in loaded] == ["0001_first", "0002_second"]
     assert loaded[0].checksum == sha256(b"SELECT 1;").hexdigest()
@@ -65,11 +65,11 @@ def test_load_migrations_orders_and_checksums_sql(tmp_path: Path) -> None:
 
 def test_load_migrations_rejects_an_empty_directory(tmp_path: Path) -> None:
     with pytest.raises(ChainlitMigrationError, match="No Chainlit migrations"):
-        database.load_migrations(tmp_path)
+        schema.load_migrations(tmp_path)
 
 
 def test_bundled_migrations_remain_immutable() -> None:
-    assert {item.version: item.checksum for item in database.load_migrations()} == {
+    assert {item.version: item.checksum for item in schema.load_migrations()} == {
         "0001_chainlit_data_layer": (
             "bff293c161ac5eb7787dae9edfdaca2fa4bd86c849eb909b6a3b1ae60bdb76e8"
         ),
@@ -88,37 +88,34 @@ def test_bundled_migrations_remain_immutable() -> None:
     }
 
 
-@pytest.mark.anyio
 async def test_apply_migrations_applies_pending_scripts_atomically() -> None:
     connection = FakeConnection()
 
-    await database.apply_migrations(connection, (migration(),))  # type: ignore[arg-type]
+    await schema.apply_migrations(connection, (migration(),))  # type: ignore[arg-type]
 
     assert connection.applied == {"0001": "checksum"}
     assert connection.transactions == 1
     assert any(query == "SELECT 42" for query, _ in connection.executions)
     assert connection.executions[-1] == (
         "SELECT pg_advisory_unlock($1)",
-        (database.MIGRATION_LOCK_ID,),
+        (schema.MIGRATION_LOCK_ID,),
     )
 
 
-@pytest.mark.anyio
 async def test_apply_migrations_skips_an_unchanged_version() -> None:
     connection = FakeConnection({"0001": "checksum"})
 
-    await database.apply_migrations(connection, (migration(),))  # type: ignore[arg-type]
+    await schema.apply_migrations(connection, (migration(),))  # type: ignore[arg-type]
 
     assert connection.transactions == 0
     assert not any(query == "SELECT 42" for query, _ in connection.executions)
 
 
-@pytest.mark.anyio
 async def test_apply_migrations_rejects_drift_and_unlocks() -> None:
     connection = FakeConnection({"0001": "old-checksum"})
 
     with pytest.raises(ChainlitMigrationError, match="has changed"):
-        await database.apply_migrations(  # type: ignore[arg-type]
+        await schema.apply_migrations(  # type: ignore[arg-type]
             connection,
             (migration(),),
         )
@@ -126,23 +123,21 @@ async def test_apply_migrations_rejects_drift_and_unlocks() -> None:
     assert "pg_advisory_unlock" in connection.executions[-1][0]
 
 
-@pytest.mark.anyio
 async def test_apply_migrations_rejects_unknown_database_versions() -> None:
     connection = FakeConnection({"9999": "future"})
 
     with pytest.raises(ChainlitMigrationError, match=r"unknown.*9999"):
-        await database.apply_migrations(  # type: ignore[arg-type]
+        await schema.apply_migrations(  # type: ignore[arg-type]
             connection,
             (migration(),),
         )
 
 
-@pytest.mark.anyio
 async def test_migration_table_name_is_validated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        database,
+        schema,
         "settings",
         Settings(
             _env_file=None,
@@ -151,19 +146,18 @@ async def test_migration_table_name_is_validated(
     )
 
     with pytest.raises(ValueError, match="Invalid PostgreSQL"):
-        await database.apply_migrations(  # type: ignore[arg-type]
+        await schema.apply_migrations(  # type: ignore[arg-type]
             FakeConnection(),
             (migration(),),
         )
 
 
-@pytest.mark.anyio
 async def test_setup_closes_the_connection(monkeypatch: pytest.MonkeyPatch) -> None:
     connection = FakeConnection()
     connect = AsyncMock(return_value=connection)
-    monkeypatch.setattr(database.asyncpg, "connect", connect)
+    monkeypatch.setattr(schema.asyncpg, "connect", connect)
 
-    await database.setup_chainlit_schema("postgresql://example/database")
+    await schema.setup_chainlit_schema("postgresql://example/database")
 
     connect.assert_awaited_once_with("postgresql://example/database")
     assert connection.closed
@@ -173,4 +167,4 @@ def test_cli_requires_database_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
     with pytest.raises(SystemExit, match="DATABASE_URL must be configured"):
-        database.main()
+        schema.main()
