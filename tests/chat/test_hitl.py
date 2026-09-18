@@ -1,17 +1,31 @@
 import asyncio
 import json
-from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import chainlit as cl
 import pytest
+from chainlit.context import init_http_context
+from chainlit.user_session import user_sessions
 from openai.types.responses import Response, ResponseFunctionToolCall
 
 from chainlit_utils.chat import hitl
-from chainlit_utils.openai.hitl import HITL_LEDGER_SCHEMA_VERSION, HitlLedgerCodec
 from chainlit_utils.settings import settings
 
 TOOL_NAME = "human_review"
+ELEMENT_NAME = "HumanReview"
+ACTION_NAME = "human_review_submit"
+
+
+@pytest.fixture
+async def chainlit_context():
+    context = init_http_context()
+    cl.chat_context.clear()
+    try:
+        yield context
+    finally:
+        cl.chat_context.clear()
+        user_sessions.pop(context.session.id, None)
 
 
 def function_call(suffix: str) -> ResponseFunctionToolCall:
@@ -25,502 +39,397 @@ def function_call(suffix: str) -> ResponseFunctionToolCall:
     )
 
 
-def continuation(
-    codec: HitlLedgerCodec,
-    suffix: str,
+def response(response_id: str, *output: object) -> Response:
+    return Response.model_construct(
+        id=response_id,
+        status="completed",
+        output=list(output),
+    )
+
+
+def workflow(
     *,
-    response_id: str,
-) -> hitl.PendingHitl:
-    return hitl.PendingHitl(
-        message=Mock(id="ledger-message"),
-        continuation=codec.continuation(
-            model_id="review-model",
-            response_id=response_id,
-            function_calls=[function_call(suffix)],
-        ),
+    continue_response: AsyncMock | None = None,
+    publish_final: AsyncMock | None = None,
+    validate_outputs=None,
+) -> tuple[hitl.HitlWorkflow, AsyncMock, AsyncMock]:
+    continue_response = continue_response or AsyncMock()
+    publish_final = publish_final or AsyncMock()
+    instance = hitl.HitlWorkflow(
+        TOOL_NAME,
+        action_name=ACTION_NAME,
+        continue_response=continue_response,
+        element_name=ELEMENT_NAME,
+        prompt=lambda calls: f"Review {len(calls)} request(s).",
+        publish_final=publish_final,
+        review=lambda calls: {"reviews": [{"call_id": call.call_id} for call in calls]},
+        validate_outputs=validate_outputs,
     )
+    return instance, continue_response, publish_final
 
 
-def recording_message(
-    writes: list[tuple[str, dict[str, object] | None]],
-    *,
-    content: str = "",
-    metadata: dict[str, object] | None = None,
-) -> SimpleNamespace:
-    message = SimpleNamespace(content=content, metadata=metadata, id="ledger-message")
-
-    async def send() -> SimpleNamespace:
-        writes.append(("send", deepcopy(message.metadata)))
-        return message
-
-    async def update() -> bool:
-        writes.append(("update", deepcopy(message.metadata)))
-        return True
-
-    message.send = AsyncMock(side_effect=send)
-    message.update = AsyncMock(side_effect=update)
-    return message
+def control(pending: hitl.PendingHitl) -> dict[str, str]:
+    raw_control = pending.message.elements[0].props[hitl.HITL_CONTROL_PROP]
+    assert isinstance(raw_control, dict)
+    return raw_control
 
 
-def install_chainlit(
-    monkeypatch: pytest.MonkeyPatch,
-    message: SimpleNamespace,
-) -> dict[str, object]:
-    message_factory = Mock(return_value=message)
-    monkeypatch.setattr(hitl.cl, "Message", message_factory)
-    session: dict[str, object] = {}
-    monkeypatch.setattr(
-        hitl.cl,
-        "user_session",
-        SimpleNamespace(
-            get=lambda key, default=None: session.get(key, default),
-            set=session.__setitem__,
-        ),
-    )
-    return session
-
-
-async def test_pending_and_completed_ledgers_are_persisted_in_order(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_publish_persists_a_normal_message_and_complete_batch(
+    chainlit_context,
 ) -> None:
-    codec = HitlLedgerCodec(TOOL_NAME)
-    writes: list[tuple[str, dict[str, object] | None]] = []
-    original_metadata = {"host": True}
-    message = recording_message(writes, metadata=original_metadata)
-    session = install_chainlit(monkeypatch, message)
+    instance, continue_response, publish_final = workflow()
 
-    pending = await hitl.persist_pending_hitl(
-        codec=codec,
-        ledger_message=None,
+    pending = await instance.publish(
+        response("resp_one", function_call("one"), function_call("two")),
         model_id="review-model",
-        response_id="resp_one",
-        function_calls=[function_call("one")],
-        prompt="Approve one?",
     )
-
-    assert pending.message is message
-    assert message.metadata is original_metadata
-    assert message.metadata["host"] is True
-    assert message.metadata[settings.MODEL_CONTEXT_EXCLUDED_KEY] is True
-    assert writes[0][0] == "send"
-    assert writes[0][1][hitl.HITL_LEDGER_METADATA_KEY]["response_id"] == "resp_one"
-    assert session[hitl.PENDING_HITL_SESSION_KEY] is pending
-
-    next_pending = await hitl.persist_pending_hitl(
-        codec=codec,
-        ledger_message=message,
-        model_id="review-model",
-        response_id="resp_two",
-        function_calls=[function_call("two")],
-        prompt="Approve two?",
-    )
-    assert writes[1][0] == "update"
-    assert writes[1][1][hitl.HITL_LEDGER_METADATA_KEY]["response_id"] == "resp_two"
-    assert session[hitl.PENDING_HITL_SESSION_KEY] is next_pending
-
-    await hitl.complete_pending_hitl(message, codec=codec)
-    assert writes[2][1][hitl.HITL_LEDGER_METADATA_KEY]["status"] == "completed"
-    assert session[hitl.PENDING_HITL_SESSION_KEY] is None
-
-
-def test_restore_completion_blocks_older_pending_replay() -> None:
-    codec = HitlLedgerCodec(TOOL_NAME)
-    pending = codec.pending_metadata(
-        codec.continuation(
-            model_id="review-model",
-            response_id="resp_one",
-            function_calls=[function_call("one")],
-        )
-    )
-    steps = [
-        {"metadata": {hitl.HITL_LEDGER_METADATA_KEY: pending}},
-        {"newer-unrelated-step": True},
-        {
-            "metadata": {
-                hitl.HITL_LEDGER_METADATA_KEY: codec.completed_metadata(),
-            }
-        },
-    ]
-
-    assert hitl.restore_pending_hitl({"steps": steps}, codec=codec) is None
-
-
-def test_restore_pending_hitl_reconstructs_the_host_message(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    codec = HitlLedgerCodec(TOOL_NAME)
-    ledger = codec.pending_metadata(
-        codec.continuation(
-            model_id="review-model",
-            response_id="resp_one",
-            function_calls=[function_call("one")],
-        )
-    )
-    step = {
-        "id": "ledger-message",
-        "createdAt": "2026-09-16T10:00:00",
-        "output": "Approve one?",
-        "type": "assistant_message",
-        "metadata": {hitl.HITL_LEDGER_METADATA_KEY: ledger, "host": True},
-        "host-added": {"future": "value"},
-    }
-    restored_message = Mock(id="ledger-message")
-    from_dict = Mock(return_value=restored_message)
-    monkeypatch.setattr(hitl.cl, "Message", SimpleNamespace(from_dict=from_dict))
-
-    pending = hitl.restore_pending_hitl({"steps": [step]}, codec=codec)
 
     assert pending is not None
-    assert pending.message is restored_message
     assert pending.continuation.response_id == "resp_one"
-    restored_step = from_dict.call_args.args[0]
-    assert restored_step["createdAt"] == "2026-09-16T10:00:00Z"
-
-
-async def test_resolve_hitl_continues_sequential_batches() -> None:
-    codec = HitlLedgerCodec(TOOL_NAME)
-    first = continuation(codec, "one", response_id="resp_one")
-    second = continuation(codec, "two", response_id="resp_two")
-    second = hitl.PendingHitl(message=first.message, continuation=second.continuation)
-    continued_responses = [
-        Response.model_construct(id="resp_two", status="completed", output=[]),
-        Response.model_construct(id="resp_final", status="completed", output=[]),
+    assert len(pending.continuation.function_calls) == 2
+    assert cl.chat_context.get() == [pending.message]
+    assert pending.message.metadata[settings.MODEL_CONTEXT_EXCLUDED_KEY] is True
+    ledger = pending.message.metadata[hitl.HITL_LEDGER_METADATA_KEY]
+    assert ledger["status"] == "pending"
+    assert ledger["response_id"] == "resp_one"
+    assert len(pending.message.elements) == 1
+    element = pending.message.elements[0]
+    assert isinstance(element, cl.CustomElement)
+    assert element.name == ELEMENT_NAME
+    assert element.props["reviews"] == [
+        {"call_id": "call_one"},
+        {"call_id": "call_two"},
     ]
-    ask = AsyncMock(side_effect=["approve", "reject"])
-    continue_response = AsyncMock(side_effect=continued_responses)
-    publish_response = AsyncMock(side_effect=[second, None])
-
-    await hitl.resolve_hitl(
-        first,
-        ask=ask,
-        continue_response=continue_response,
-        publish_response=publish_response,
-    )
-
-    assert continue_response.await_args_list[0].args[0] == [
-        {
-            "type": "function_call_output",
-            "call_id": "call_one",
-            "output": "approve",
-        }
-    ]
-    assert continue_response.await_args_list[0].kwargs == {
-        "model_id": "review-model",
-        "previous_response_id": "resp_one",
+    assert control(pending) == {
+        "action": ACTION_NAME,
+        "element_id": element.id,
+        "revision": "resp_one",
+        "step_id": pending.message.id,
     }
-    assert continue_response.await_args_list[1].kwargs["previous_response_id"] == (
-        "resp_two"
+    assert (
+        pending.message.metadata[hitl.HITL_ELEMENT_METADATA_KEY]
+        == element.id
+        == pending.element_id
     )
-    assert publish_response.await_count == 2
-
-
-async def test_cancelled_batch_is_not_partially_submitted() -> None:
-    codec = HitlLedgerCodec(TOOL_NAME)
-    pending = hitl.PendingHitl(
-        message=Mock(id="ledger-message"),
-        continuation=codec.continuation(
-            model_id="review-model",
-            response_id="resp_one",
-            function_calls=[function_call("one"), function_call("two")],
-        ),
-    )
-    ask = AsyncMock(side_effect=["approve", None])
-    continue_response = AsyncMock()
-    publish_response = AsyncMock()
-
-    await hitl.resolve_hitl(
-        pending,
-        ask=ask,
-        continue_response=continue_response,
-        publish_response=publish_response,
-    )
-
+    assert json.loads(str(element.content)) == element.props
     continue_response.assert_not_awaited()
-    publish_response.assert_not_awaited()
+    publish_final.assert_not_awaited()
 
 
-async def test_remove_persisted_custom_elements_removes_only_stale_controls(
+async def test_new_user_turn_is_blocked_by_the_persisted_ledger(
+    chainlit_context,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stale = {
-        "id": "element-stale",
-        "type": "custom",
-        "name": "Review",
-        "forId": "ledger-message",
+    instance, _, _ = workflow()
+    await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    notify = AsyncMock()
+    monkeypatch.setattr(hitl, "send_ui_message", notify)
+    trigger = SimpleNamespace(metadata={"host": True}, update=AsyncMock())
+
+    handled = await instance.block_new_message(trigger)
+
+    assert handled is True
+    assert trigger.metadata == {
+        "host": True,
+        settings.MODEL_CONTEXT_EXCLUDED_KEY: True,
     }
-    other = {
-        "id": "element-other",
-        "type": "custom",
-        "name": "Review",
-        "forId": "another-message",
-    }
-    thread = {"steps": [], "elements": [stale, other]}
-    element = SimpleNamespace(remove=AsyncMock())
-    from_dict = Mock(return_value=element)
-    monkeypatch.setattr(
-        hitl.cl,
-        "CustomElement",
-        SimpleNamespace(from_dict=from_dict),
+    trigger.update.assert_awaited_once_with()
+    notify.assert_awaited_once_with(
+        "Resolve the pending interrupt before starting another request."
     )
 
-    await hitl.remove_persisted_custom_elements(
-        thread,
-        step_id="ledger-message",
-        element_name="Review",
+
+async def test_submit_completes_one_continuation_and_removes_the_control(
+    chainlit_context,
+) -> None:
+    final = response("resp_final")
+    continue_response = AsyncMock(return_value=final)
+    instance, _, publish_final = workflow(continue_response=continue_response)
+    pending = await instance.publish(
+        response("resp_one", function_call("one"), function_call("two")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
+    element = pending.message.elements[0]
+    element.remove = AsyncMock()  # type: ignore[method-assign]
+
+    result = await instance.submit(
+        step_id=review_control["step_id"],
+        element_id=review_control["element_id"],
+        revision=review_control["revision"],
+        outputs=[" approve ", "reject"],
     )
 
-    assert thread["elements"] == [other]
-    from_dict.assert_called_once_with(stale)
+    assert result is None
+    continue_response.assert_awaited_once_with(
+        [
+            {
+                "type": "function_call_output",
+                "call_id": "call_one",
+                "output": " approve ",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_two",
+                "output": "reject",
+            },
+        ],
+        model_id="review-model",
+        previous_response_id="resp_one",
+    )
+    ledger = pending.message.metadata[hitl.HITL_LEDGER_METADATA_KEY]
+    assert ledger["status"] == "completed"
+    assert hitl.HITL_ELEMENT_METADATA_KEY not in pending.message.metadata
+    assert pending.message.elements == []
     element.remove.assert_awaited_once_with()
-
-
-async def test_workflow_persists_sequential_batches_before_publishing_final(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    writes: list[tuple[str, dict[str, object] | None]] = []
-    message = recording_message(writes)
-    session = install_chainlit(monkeypatch, message)
-    first = Response.model_construct(
-        id="resp_one",
-        status="completed",
-        output=[function_call("one")],
-    )
-    second = Response.model_construct(
-        id="resp_two",
-        status="completed",
-        output=[function_call("two")],
-    )
-    final = Response.model_construct(
-        id="resp_final",
-        status="completed",
-        output=[],
-    )
-    ask = AsyncMock(side_effect=["approve", "reject"])
-    continue_response = AsyncMock(side_effect=[second, final])
-    publish_final = AsyncMock()
-    workflow = hitl.HitlWorkflow(
-        TOOL_NAME,
-        ask=ask,
-        continue_response=continue_response,
-        prompt=lambda calls: f"Review {calls[0].call_id}",
-        publish_final=publish_final,
-    )
-
-    await workflow.run(first, model_id="review-model")
-
-    assert continue_response.await_args_list[0].args[0] == [
-        {
-            "type": "function_call_output",
-            "call_id": "call_one",
-            "output": "approve",
-        }
-    ]
-    assert [
-        call.kwargs["previous_response_id"]
-        for call in continue_response.await_args_list
-    ] == [
-        "resp_one",
-        "resp_two",
-    ]
-    assert writes[0][1][hitl.HITL_LEDGER_METADATA_KEY]["response_id"] == "resp_one"
-    assert writes[1][1][hitl.HITL_LEDGER_METADATA_KEY]["response_id"] == "resp_two"
-    assert writes[2][1][hitl.HITL_LEDGER_METADATA_KEY]["status"] == "completed"
-    assert session[hitl.PENDING_HITL_SESSION_KEY] is None
     publish_final.assert_awaited_once_with(final)
 
 
-async def test_workflow_keeps_the_pending_ledger_when_continuation_fails(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_chained_interrupt_updates_the_same_element_one_action_at_a_time(
+    chainlit_context,
 ) -> None:
-    writes: list[tuple[str, dict[str, object] | None]] = []
-    message = recording_message(writes)
-    session = install_chainlit(monkeypatch, message)
-    pending_response = Response.model_construct(
-        id="resp_one",
-        status="completed",
-        output=[function_call("one")],
+    second = response("resp_two", function_call("two"))
+    final = response("resp_final")
+    continue_response = AsyncMock(side_effect=[second, final])
+    instance, _, publish_final = workflow(continue_response=continue_response)
+    first = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
     )
-    failed_response = Response.model_construct(
+    assert first is not None
+    first_control = control(first)
+    element_id = first_control["element_id"]
+
+    next_pending = await instance.submit(
+        step_id=first_control["step_id"],
+        element_id=element_id,
+        revision=first_control["revision"],
+        outputs=["approve"],
+    )
+
+    assert next_pending is not None
+    assert continue_response.await_count == 1
+    assert next_pending.message is first.message
+    assert next_pending.message.elements[0].id == element_id
+    next_control = control(next_pending)
+    assert next_control["revision"] == "resp_two"
+    assert next_pending.message.elements[0].props["reviews"] == [
+        {"call_id": "call_two"}
+    ]
+    publish_final.assert_not_awaited()
+
+    next_pending.message.elements[0].remove = AsyncMock()  # type: ignore[method-assign]
+    await instance.submit(
+        step_id=next_control["step_id"],
+        element_id=next_control["element_id"],
+        revision=next_control["revision"],
+        outputs=["reject"],
+    )
+
+    assert continue_response.await_count == 2
+    publish_final.assert_awaited_once_with(final)
+
+
+async def test_failed_continuation_keeps_the_prior_revision_pending(
+    chainlit_context,
+) -> None:
+    failed = Response.model_construct(
         id="resp_failed",
         status="failed",
         output=[],
         error=SimpleNamespace(message="Resume failed"),
     )
-    workflow = hitl.HitlWorkflow(
-        TOOL_NAME,
-        ask=AsyncMock(return_value="approve"),
-        continue_response=AsyncMock(return_value=failed_response),
-        prompt=Mock(return_value="Approve one?"),
-        publish_final=AsyncMock(),
+    instance, _, publish_final = workflow(
+        continue_response=AsyncMock(return_value=failed)
     )
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
 
     with pytest.raises(RuntimeError, match="Resume failed"):
-        await workflow.run(pending_response, model_id="review-model")
-
-    assert len(writes) == 1
-    assert writes[0][1][hitl.HITL_LEDGER_METADATA_KEY]["status"] == "pending"
-    assert isinstance(session[hitl.PENDING_HITL_SESSION_KEY], hitl.PendingHitl)
-
-
-async def test_workflow_keeps_the_pending_ledger_when_prompt_is_cancelled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    writes: list[tuple[str, dict[str, object] | None]] = []
-    message = recording_message(writes)
-    session = install_chainlit(monkeypatch, message)
-    pending_response = Response.model_construct(
-        id="resp_one",
-        status="completed",
-        output=[function_call("one")],
-    )
-    workflow = hitl.HitlWorkflow(
-        TOOL_NAME,
-        ask=AsyncMock(side_effect=asyncio.CancelledError),
-        continue_response=AsyncMock(),
-        prompt=Mock(return_value="Approve one?"),
-        publish_final=AsyncMock(),
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        await workflow.run(pending_response, model_id="review-model")
-
-    assert len(writes) == 1
-    assert writes[0][1][hitl.HITL_LEDGER_METADATA_KEY]["status"] == "pending"
-    assert isinstance(session[hitl.PENDING_HITL_SESSION_KEY], hitl.PendingHitl)
-
-
-async def test_workflow_restores_the_prompt_after_thread_hydration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    codec = HitlLedgerCodec(TOOL_NAME)
-    ledger = codec.pending_metadata(
-        codec.continuation(
-            model_id="review-model",
-            response_id="resp_one",
-            function_calls=[function_call("one")],
+        await instance.submit(
+            step_id=review_control["step_id"],
+            element_id=review_control["element_id"],
+            revision=review_control["revision"],
+            outputs=["approve"],
         )
+
+    ledger = pending.message.metadata[hitl.HITL_LEDGER_METADATA_KEY]
+    assert ledger["status"] == "pending"
+    assert ledger["response_id"] == "resp_one"
+    assert control(pending)["revision"] == "resp_one"
+    publish_final.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("step_id", "another-step", "stale"),
+        ("element_id", "another-element", "control"),
+        ("revision", "another-response", "stale"),
+    ],
+)
+async def test_stale_or_forged_submission_is_rejected_before_continuation(
+    chainlit_context,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    instance, continue_response, _ = workflow()
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
     )
-    thread = {
-        "steps": [
-            {
-                "id": "ledger-message",
-                "createdAt": "2026-09-16T10:00:00",
-                "output": "Approve one?",
-                "type": "assistant_message",
-                "metadata": {hitl.HITL_LEDGER_METADATA_KEY: ledger},
-            }
-        ],
-        "elements": [],
+    assert pending is not None
+    submission = {
+        "step_id": control(pending)["step_id"],
+        "element_id": control(pending)["element_id"],
+        "revision": control(pending)["revision"],
+        "outputs": ["approve"],
     }
-    restored = Mock(id="ledger-message")
-    message_factory = SimpleNamespace(from_dict=Mock(return_value=restored))
-    session: dict[str, object] = {}
-    monkeypatch.setattr(hitl.cl, "Message", message_factory)
-    monkeypatch.setattr(
-        hitl.cl,
-        "user_session",
-        SimpleNamespace(
-            get=lambda key, default=None: session.get(key, default),
-            set=session.__setitem__,
-        ),
-    )
-    schedule = Mock()
-    monkeypatch.setattr(hitl, "schedule_after_thread_hydration", schedule)
-    workflow = hitl.HitlWorkflow(
-        TOOL_NAME,
-        ask=AsyncMock(),
-        continue_response=AsyncMock(),
-        prompt=Mock(return_value="Approve one?"),
-        publish_final=AsyncMock(),
-        element_name="Review",
-    )
+    submission[field] = value
 
-    await workflow.restore(thread)
+    with pytest.raises(hitl.InvalidHitlSubmissionError, match=message):
+        await instance.submit(**submission)
 
-    pending = session[hitl.PENDING_HITL_SESSION_KEY]
-    assert isinstance(pending, hitl.PendingHitl)
-    assert pending.message is restored
-    assert pending.continuation.response_id == "resp_one"
-    schedule.assert_called_once()
+    continue_response.assert_not_awaited()
 
 
-async def test_workflow_reports_an_unsupported_persisted_ledger(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_application_validation_runs_against_trusted_calls(
+    chainlit_context,
 ) -> None:
-    codec = HitlLedgerCodec(TOOL_NAME)
-    ledger = codec.pending_metadata(
-        codec.continuation(
-            model_id="review-model",
-            response_id="resp_one",
-            function_calls=[function_call("one")],
+    validate = Mock(side_effect=ValueError("That decision is not allowed."))
+    instance, continue_response, _ = workflow(validate_outputs=validate)
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
+
+    with pytest.raises(hitl.InvalidHitlSubmissionError, match="not allowed"):
+        await instance.submit(
+            step_id=review_control["step_id"],
+            element_id=review_control["element_id"],
+            revision=review_control["revision"],
+            outputs=["forged"],
         )
-    )
-    ledger["schema_version"] = HITL_LEDGER_SCHEMA_VERSION + 1
-    thread = {"steps": [{"metadata": {hitl.HITL_LEDGER_METADATA_KEY: ledger}}]}
-    session: dict[str, object] = {}
-    monkeypatch.setattr(
-        hitl.cl,
-        "user_session",
-        SimpleNamespace(
-            get=lambda key, default=None: session.get(key, default),
-            set=session.__setitem__,
-        ),
-    )
-    schedule = Mock()
-    notify = AsyncMock()
-    monkeypatch.setattr(hitl, "schedule_after_thread_hydration", schedule)
-    monkeypatch.setattr(hitl, "send_ui_message", notify)
-    workflow = hitl.HitlWorkflow(
-        TOOL_NAME,
-        ask=AsyncMock(),
-        continue_response=AsyncMock(),
-        prompt=Mock(),
-        publish_final=AsyncMock(),
-    )
 
-    await workflow.restore(thread)
-
-    schedule.assert_called_once()
-    await schedule.call_args.args[0]()
-    notify.assert_awaited_once_with(
-        "Response failed: HITL ledger schema is unsupported."
-    )
-    assert session[hitl.PENDING_HITL_SESSION_KEY] is None
+    validate.assert_called_once_with(pending.continuation.function_calls, ["forged"])
+    continue_response.assert_not_awaited()
 
 
-async def test_workflow_reopens_pending_review_instead_of_starting_a_request(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_concurrent_same_session_duplicates_continue_only_once(
+    chainlit_context,
 ) -> None:
-    pending = continuation(HitlLedgerCodec(TOOL_NAME), "one", response_id="resp_one")
-    session = {hitl.PENDING_HITL_SESSION_KEY: pending}
-    monkeypatch.setattr(
-        hitl.cl,
-        "user_session",
-        SimpleNamespace(
-            get=lambda key, default=None: session.get(key, default),
-            set=session.__setitem__,
-        ),
-    )
-    notify = AsyncMock()
-    monkeypatch.setattr(hitl, "send_ui_message", notify)
-    ask = AsyncMock(return_value=None)
-    workflow = hitl.HitlWorkflow(
-        TOOL_NAME,
-        ask=ask,
-        continue_response=AsyncMock(),
-        prompt=Mock(),
-        publish_final=AsyncMock(),
-    )
-    trigger = SimpleNamespace(metadata={}, update=AsyncMock())
+    continuation_started = asyncio.Event()
+    release_continuation = asyncio.Event()
 
-    handled = await workflow.continue_pending(trigger)
+    async def continue_response(*_args, **_kwargs) -> Response:
+        continuation_started.set()
+        await release_continuation.wait()
+        return response("resp_final")
 
-    assert handled is True
-    assert trigger.metadata[settings.MODEL_CONTEXT_EXCLUDED_KEY] is True
-    trigger.update.assert_awaited_once_with()
-    notify.assert_awaited_once_with(
-        "Resolve the pending interrupt before starting another request."
+    continue_mock = AsyncMock(side_effect=continue_response)
+    instance, _, _ = workflow(continue_response=continue_mock)
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
     )
-    ask.assert_awaited_once_with(
-        pending.continuation.function_calls[0], pending.message
+    assert pending is not None
+    review_control = control(pending)
+    pending.message.elements[0].remove = AsyncMock()  # type: ignore[method-assign]
+    submission = {
+        "step_id": review_control["step_id"],
+        "element_id": review_control["element_id"],
+        "revision": review_control["revision"],
+        "outputs": ["approve"],
+    }
+    start = asyncio.Event()
+
+    async def submit() -> hitl.PendingHitl | None:
+        await start.wait()
+        return await instance.submit(**submission)
+
+    first = asyncio.create_task(submit())
+    duplicate = asyncio.create_task(submit())
+    start.set()
+    await continuation_started.wait()
+    release_continuation.set()
+    results = await asyncio.gather(first, duplicate, return_exceptions=True)
+
+    assert continue_mock.await_count == 1
+    assert sum(result is None for result in results) == 1
+    errors = [result for result in results if isinstance(result, Exception)]
+    assert len(errors) == 1
+    assert isinstance(errors[0], hitl.InvalidHitlSubmissionError)
+    assert "no longer pending" in str(errors[0])
+
+
+async def test_resumed_thread_reconstructs_its_control_from_persisted_metadata(
+    chainlit_context,
+) -> None:
+    second = response("resp_two", function_call("two"))
+    final = response("resp_final")
+    instance, continue_response, publish_final = workflow(
+        continue_response=AsyncMock(side_effect=[second, final])
     )
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
+    step_dict = pending.message.to_dict()
+
+    cl.chat_context.clear()
+    restored_message = cl.Message.from_dict(step_dict)
+    cl.chat_context.add(restored_message)
+    assert restored_message.elements == []
+
+    next_pending = await instance.submit(
+        step_id=review_control["step_id"],
+        element_id=review_control["element_id"],
+        revision=review_control["revision"],
+        outputs=["approve"],
+    )
+
+    assert next_pending is not None
+    assert next_pending.message is restored_message
+    assert next_pending.element_id == review_control["element_id"]
+    assert next_pending.message.elements[0].id == review_control["element_id"]
+    assert control(next_pending)["revision"] == "resp_two"
+    publish_final.assert_not_awaited()
+
+    next_control = control(next_pending)
+    next_pending.message.elements[0].remove = AsyncMock()  # type: ignore[method-assign]
+    await instance.submit(
+        step_id=next_control["step_id"],
+        element_id=next_control["element_id"],
+        revision=next_control["revision"],
+        outputs=["reject"],
+    )
+
+    assert continue_response.await_count == 2
+    publish_final.assert_awaited_once_with(final)
+
+
+async def test_terminal_response_is_published_without_a_ledger(
+    chainlit_context,
+) -> None:
+    final = response("resp_final")
+    instance, continue_response, publish_final = workflow()
+
+    result = await instance.publish(final, model_id="review-model")
+
+    assert result is None
+    assert cl.chat_context.get() == []
+    continue_response.assert_not_awaited()
+    publish_final.assert_awaited_once_with(final)

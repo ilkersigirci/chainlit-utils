@@ -10,7 +10,6 @@ Reusable building blocks for Chainlit applications:
 - durable human-in-the-loop Responses continuations;
 - MCP discovery and client-side tool execution;
 - secure OIDC login with encrypted, per-browser token delegation;
-- restoration of live UI after a persisted thread resumes; and
 - retrieval of the authenticated Chainlit user identifier.
 
 The package owns reusable protocol and Chainlit integration. Applications keep
@@ -152,30 +151,54 @@ profile must have spontaneous uploads enabled.
 
 `chainlit_utils.openai.hitl` validates and serializes exact Responses function-call
 batches. `HitlWorkflow` persists the continuation in a model-context-excluded
-Chainlit message, restores it after reconnect, and drives sequential pauses.
+Chainlit message with a custom element. It then returns, so the pending review is
+ordinary persisted UI rather than a socket-bound ask coroutine.
 
-Configure one workflow with the application-owned tool name and four small
-callbacks:
+Configure one workflow with the application-owned tool, element, and action
+names plus small presentation and request callbacks:
 
 ```python
+import chainlit as cl
+
 from chainlit_utils.chat.hitl import HitlWorkflow
 
 hitl = HitlWorkflow(
     "human_review",
-    ask=ask_for_output,
+    action_name="human_review_submit",
     continue_response=continue_response,
+    element_name="HumanReview",
     prompt=prompt_for_calls,
     publish_final=publish_final,
-    element_name="HumanReview",
+    review=review_props,
+    validate_outputs=validate_outputs,
 )
+
+
+@cl.action_callback("human_review_submit")
+async def submit_review(action: cl.Action):
+    submission = ReviewSubmission.model_validate(action.payload)
+    await hitl.submit(
+        step_id=submission.step_id,
+        element_id=submission.element_id,
+        revision=submission.revision,
+        outputs=submission.outputs,
+    )
 ```
 
-Call `await hitl.run(response, model_id=model_id)` when that tool appears,
-`await hitl.restore(thread)` from `on_chat_resume`, and
-`await hitl.continue_pending(message)` before starting a new request. Call
-`hitl.cancel()` from `on_chat_end` so a disconnected live prompt does not remain
-active. The callbacks own the API request, final rendering, tool payload schema,
-review UI, and client credentials.
+Call `await hitl.publish(response, model_id=model_id)` when the tool appears and
+`await hitl.block_new_message(message)` before starting a new request. The
+custom element submits its opaque step, element, and revision references through
+Chainlit's `callAction`; model IDs, response IDs, function calls, and the
+expected element ID are always read from trusted current-thread message
+metadata. Each accepted action advances one Responses transition. A later
+interrupt updates the same persisted form; a terminal response marks the ledger
+complete and removes it.
+
+Chainlit natively restores the message and custom element when a persisted
+thread is opened. No `on_chat_end` cancellation, `on_chat_resume` recreation,
+session task ownership, reconnect timer, or `user_session` HITL cache is needed.
+The application callbacks still own the API request, final rendering, payload
+schema, review UI, and client credentials.
 
 OpenAI continuations by ID require a stored prior Response. Stateless client-tool
 loops instead use `continuation_input` to replay every output item in order.
@@ -281,18 +304,10 @@ Omit `token_store` when OIDC is used only to log in and the downstream service
 uses a static credential. The application remains responsible for validating
 its URLs and secrets before constructing these services.
 
-## Thread resume
-
-`chainlit_utils.chat.resume.reuse_persisted_step` lets a transient message
-update an existing persisted step. `schedule_after_thread_hydration` schedules
-live UI restoration after Chainlit finishes replacing the browser's thread
-state; keep its use limited to resume flows that need interactive elements
-recreated.
-
 ## Development
 
 The source modules are grouped by responsibility: `chat/` owns history,
-settings, resume, and Chainlit HITL lifecycle helpers; `openai/` owns Responses
+settings, and Chainlit HITL lifecycle helpers; `openai/` owns Responses
 rendering, function tools, Files, and protocol-level HITL integration; `sso/`
 owns OIDC clients, Chainlit login, and delegated-token storage.
 `mcp.py` and `auth.py` own MCP tools and the authenticated-user identifier.
