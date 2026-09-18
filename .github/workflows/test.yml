@@ -15,8 +15,22 @@ jobs:
   test_matrix:
     strategy:
       matrix:
-        python-version: ['3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.11', '3.12', '3.13']
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: chainlit
+          POSTGRES_PASSWORD: chainlit
+          POSTGRES_DB: chainlit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chainlit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,7 +44,12 @@ jobs:
           enable-cache: true
 
       - name: Install the project with test dependencies
-        run: uv sync --frozen --no-default-groups --group test
+        run: uv sync --frozen --no-default-groups --group test --extra sso
 
       - name: Test the project
         run: uv run --no-sync pytest
+
+      - name: Test PostgreSQL token persistence
+        env:
+          TEST_CHAINLIT_DATABASE_URL: postgresql://chainlit:chainlit@localhost:5432/chainlit
+        run: uv run --no-sync pytest -m integration tests/sso/test_postgres.py

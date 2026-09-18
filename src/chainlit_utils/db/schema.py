@@ -1,4 +1,4 @@
-"""Versioned PostgreSQL migrations for Chainlit conversation persistence."""
+"""Version and apply the PostgreSQL schema for Chainlit persistence."""
 
 from __future__ import annotations
 
