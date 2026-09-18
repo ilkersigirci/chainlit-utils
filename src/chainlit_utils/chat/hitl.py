@@ -6,6 +6,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol, cast
 
 import chainlit as cl
@@ -289,6 +290,7 @@ class HitlWorkflow:
                 **(message.metadata or {}),
                 HITL_ELEMENT_METADATA_KEY: control.id,
             }
+            _normalize_chainlit_created_at(message)
             if ledger_message is None:
                 await message.send()
             else:
@@ -313,6 +315,7 @@ class HitlWorkflow:
             }
             # Persist completion before rendering final output so a reconnect
             # cannot replay the already-consumed continuation.
+            _normalize_chainlit_created_at(ledger_message)
             await ledger_message.update()
             if element is not None:
                 try:
@@ -353,6 +356,21 @@ def _set_ledger_metadata(
         **(message.metadata or {}),
         metadata_key: dict(ledger),
     }
+
+
+def _normalize_chainlit_created_at(message: cl.Message) -> None:
+    """Make an official-data-layer timestamp safe for a later message update."""
+    if not message.created_at:
+        return
+    try:
+        timestamp = datetime.fromisoformat(message.created_at)
+    except ValueError:
+        return
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.astimezone(timezone.utc).replace(tzinfo=None)
+    # Chainlit 2.12 serializes PostgreSQL timestamps without ``Z`` when a
+    # thread is hydrated, but its update path parses only this exact form.
+    message.created_at = timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 __all__ = [

@@ -388,6 +388,8 @@ async def test_resumed_thread_reconstructs_its_control_from_persisted_metadata(
     assert pending is not None
     review_control = control(pending)
     step_dict = pending.message.to_dict()
+    assert step_dict["createdAt"] is not None
+    step_dict["createdAt"] = "2026-09-18T13:48:54"
 
     cl.chat_context.clear()
     restored_message = cl.Message.from_dict(step_dict)
@@ -406,6 +408,7 @@ async def test_resumed_thread_reconstructs_its_control_from_persisted_metadata(
     assert next_pending.element_id == review_control["element_id"]
     assert next_pending.message.elements[0].id == review_control["element_id"]
     assert control(next_pending)["revision"] == "resp_two"
+    assert next_pending.message.created_at == "2026-09-18T13:48:54.000000Z"
     publish_final.assert_not_awaited()
 
     next_control = control(next_pending)

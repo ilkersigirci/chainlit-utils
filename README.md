@@ -200,6 +200,11 @@ session task ownership, reconnect timer, or `user_session` HITL cache is needed.
 The application callbacks still own the API request, final rendering, payload
 schema, review UI, and client credentials.
 
+`HitlWorkflow` also normalizes the timestamp on a restored ledger message before
+updating it. Chainlit 2.12's official PostgreSQL layer hydrates `createdAt`
+without the trailing `Z` that its own update path requires; without this narrow
+compatibility fix, the UI can finish while the durable ledger remains pending.
+
 OpenAI continuations by ID require a stored prior Response. Stateless client-tool
 loops instead use `continuation_input` to replay every output item in order.
 
