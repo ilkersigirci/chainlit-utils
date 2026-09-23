@@ -2,9 +2,16 @@
 
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TypeGuard
 
-from chainlit.input_widget import InputWidget, Select, Switch, TextInput
+from chainlit.input_widget import (
+    InputWidget,
+    NumberInput,
+    Select,
+    Slider,
+    Switch,
+    TextInput,
+)
 
 
 class SettingsSerializationError(ValueError):
@@ -47,11 +54,15 @@ def serialize_settings(
     if defaults is None or values is None:
         return None
 
-    changed = {
-        name: values[name]
+    normalized = {
+        name: _as_default_type(values[name], default)
         for name, default in defaults.items()
         if name in values
-        and not (type(values[name]) is type(default) and values[name] == default)
+    }
+    changed = {
+        name: value
+        for name, value in normalized.items()
+        if not (type(value) is type(defaults[name]) and value == defaults[name])
     }
     if not changed:
         return None
@@ -100,6 +111,26 @@ def _widget_for_property(
             initial=initial,
         )
 
+    if schema_type == "integer":
+        if not _is_integer(default):
+            return None
+        minimum, maximum = schema.get("minimum"), schema.get("maximum")
+        if not (_is_integer(minimum) and _is_integer(maximum)):
+            initial = candidate if _is_integer(candidate) else default
+            return NumberInput(
+                id=name, label=label, description=description, initial=initial
+            )
+        in_range = _is_integer(candidate) and minimum <= candidate <= maximum
+        return Slider(
+            id=name,
+            label=label,
+            description=description,
+            initial=candidate if in_range else default,
+            min=minimum,
+            max=maximum,
+            step=1,
+        )
+
     if schema_type != "string" or not isinstance(default, str):
         return None
 
@@ -131,6 +162,18 @@ def _widget_for_property(
         description=description,
         initial=initial,
     )
+
+
+def _as_default_type(value: Any, default: Any) -> Any:
+    """Return Chainlit's float number widgets' whole values as integers."""
+    if _is_integer(default) and isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _is_integer(value: Any) -> TypeGuard[int]:
+    # bool subclasses int, but a JSON Schema integer never accepts true/false.
+    return type(value) is int
 
 
 def _optional_text(value: Any) -> str | None:

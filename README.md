@@ -109,9 +109,11 @@ encoded = serialize_settings(defaults, selected_values, max_length=512)
 metadata = {"my_runtime_settings": encoded} if encoded is not None else {}
 ```
 
-The widget adapter intentionally supports only booleans, string enums, and
-strings. The receiving application remains responsible for full schema
-validation.
+The widget adapter intentionally supports only booleans, string enums,
+strings, and integers. An integer with both `minimum` and `maximum` becomes a
+slider; other integers become a number input. `serialize_settings` sends whole
+numbers from those widgets as integers. The receiving application remains
+responsible for full schema validation.
 
 ## OpenAI Responses and Files
 

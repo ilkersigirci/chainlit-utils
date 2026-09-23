@@ -112,3 +112,30 @@ def test_unencodable_settings_are_rejected(
 def test_negative_max_length_is_rejected() -> None:
     with pytest.raises(ValueError, match="cannot be negative"):
         serialize_settings({}, {}, max_length=-1)
+
+
+def test_integer_properties_use_number_widgets() -> None:
+    json_schema = {
+        "properties": {
+            "delay": {"type": "integer", "minimum": 0, "maximum": 300},
+            "retries": {"type": "integer"},
+        }
+    }
+    defaults = {"delay": 5, "retries": 2}
+
+    saved = settings_widgets(json_schema, defaults, {"delay": 30, "retries": 4})
+    out_of_range = settings_widgets(json_schema, defaults, {"delay": 301})
+
+    assert [(type(widget).__name__, widget.id, widget.initial) for widget in saved] == [
+        ("Slider", "delay", 30),
+        ("NumberInput", "retries", 4),
+    ]
+    assert (saved[0].min, saved[0].max, saved[0].step) == (0, 300, 1)
+    assert out_of_range[0].initial == 5
+
+
+def test_whole_number_widget_values_serialize_as_integers() -> None:
+    defaults = {"delay": 5}
+
+    assert serialize_settings(defaults, {"delay": 30.0}) == '{"delay":30}'
+    assert serialize_settings(defaults, {"delay": 5.0}) is None
