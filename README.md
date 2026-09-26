@@ -59,6 +59,25 @@ Review Chainlit's migration guidance before widening the supported Chainlit
 version range. The bundled migrations target Chainlit 2.12 or newer within the
 2.x series.
 
+## Reconnected sessions
+
+A browser that reconnects with its session ID, after a network drop or when a
+resumed thread restores its chat profile, gets its live server session back.
+Since Chainlit 2.8.2, Chainlit then resumes that thread again: it replaces
+`user_session` with the persisted thread metadata, reruns `on_chat_resume`, and
+appends every persisted message to `cl.chat_context` once more. Keep the
+restored session instead by calling this once at startup:
+
+```python
+from chainlit_utils.sessions import keep_restored_sessions
+
+keep_restored_sessions()
+```
+
+The function replaces Chainlit's `connection_successful` handler. A strict
+expected-failure test starts passing once Chainlit keeps restored sessions
+itself; remove the function then.
+
 ## Chat helpers
 
 ```python
@@ -317,7 +336,8 @@ The source modules are grouped by responsibility: `chat/` owns history,
 settings, and Chainlit HITL lifecycle helpers; `openai/` owns Responses
 rendering, function tools, Files, and protocol-level HITL integration; `sso/`
 owns OIDC clients, Chainlit login, and delegated-token storage.
-`mcp.py` and `auth.py` own MCP tools and the authenticated-user identifier.
+`mcp.py` and `auth.py` own MCP tools and the authenticated-user identifier;
+`sessions.py` keeps reconnected WebSocket sessions.
 `db/schema.py` owns PostgreSQL schema migrations and loads its bundled SQL from
 `db/migrations/`. Import helpers from their concrete modules.
 
