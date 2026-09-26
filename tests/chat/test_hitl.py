@@ -436,3 +436,69 @@ async def test_terminal_response_is_published_without_a_ledger(
     assert cl.chat_context.get() == []
     continue_response.assert_not_awaited()
     publish_final.assert_awaited_once_with(final)
+
+
+@pytest.mark.parametrize(
+    ("change", "failure", "reply"),
+    [
+        ({}, None, {"ok": True}),
+        (
+            {"model_id": "browser-controlled"},
+            None,
+            {"ok": False, "error": "Invalid human-review submission."},
+        ),
+        (
+            {"outputs": "approve"},
+            None,
+            {"ok": False, "error": "Invalid human-review submission."},
+        ),
+        (
+            {"revision": "resp_old"},
+            None,
+            {"ok": False, "error": "This human-review revision is stale."},
+        ),
+        (
+            {},
+            RuntimeError("gateway down"),
+            {"ok": False, "error": "The human review could not be submitted."},
+        ),
+    ],
+    ids=["accepted", "extra-field", "text-outputs", "stale", "continuation-failed"],
+)
+async def test_submit_action_replies_to_the_review_element(
+    monkeypatch: pytest.MonkeyPatch,
+    chainlit_context,
+    change: dict[str, object],
+    failure: Exception | None,
+    reply: dict[str, object],
+) -> None:
+    instance, _, publish_final = workflow(
+        continue_response=AsyncMock(
+            side_effect=failure, return_value=response("resp_two")
+        )
+    )
+    notice = AsyncMock()
+    monkeypatch.setattr(hitl, "send_ui_message", notice)
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
+    payload = {
+        "step_id": review_control["step_id"],
+        "element_id": review_control["element_id"],
+        "revision": review_control["revision"],
+        "outputs": ["approve"],
+        **change,
+    }
+
+    result = await instance.submit_action(cl.Action(name=ACTION_NAME, payload=payload))
+
+    assert result == reply
+    if reply["ok"]:
+        publish_final.assert_awaited_once()
+    if failure is not None:
+        notice.assert_awaited_once_with("Response failed: gateway down")
+    else:
+        notice.assert_not_awaited()

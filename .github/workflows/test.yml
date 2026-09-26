@@ -44,7 +44,7 @@ jobs:
           enable-cache: true
 
       - name: Install the project with test dependencies
-        run: uv sync --frozen --no-default-groups --group test --extra sso
+        run: uv sync --frozen --no-default-groups --group test --all-extras
 
       - name: Test the project
         run: uv run --no-sync pytest

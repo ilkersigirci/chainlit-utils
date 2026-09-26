@@ -7,7 +7,9 @@ Reusable building blocks for Chainlit applications:
 - conversion of simple JSON Schema settings into Chainlit widgets;
 - compact serialization of changed chat settings;
 - OpenAI Responses rendering and attachment upload;
-- durable human-in-the-loop Responses continuations;
+- microphone transcription and read-aloud speech through the OpenAI audio API;
+- durable human-in-the-loop Responses continuations with a bundled review form;
+- serving bundled custom elements and browser scripts without copying them;
 - MCP discovery and client-side tool execution;
 - secure OIDC login with encrypted, per-browser token delegation;
 - retrieval of the authenticated Chainlit user identifier.
@@ -24,14 +26,16 @@ uv add chainlit-utils
 ```
 
 Install the `sso` extra only when the application uses the OIDC login or
-delegated-token modules:
+delegated-token modules, and the `audio` extra only when it uses
+`chainlit_utils.openai.audio`:
 
 ```bash
 uv add "chainlit-utils[sso]"
+uv add "chainlit-utils[audio]"
 ```
 
-For local development before publishing, append `[sso]` only when those
-modules are needed:
+For local development before publishing, append the extras those modules
+need:
 
 ```bash
 uv add --editable /path/to/chainlit-utils
@@ -77,6 +81,27 @@ keep_restored_sessions()
 The function replaces Chainlit's `connection_successful` handler. A strict
 expected-failure test starts passing once Chainlit keeps restored sessions
 itself; remove the function then.
+
+## Custom elements and browser scripts
+
+Chainlit loads custom elements only from the application's
+`public/elements/` directory. Call `serve_public_files()` once at startup to
+serve the package's elements and scripts from Chainlit's own server instead of
+copying them:
+
+```python
+from chainlit_utils.public_files import serve_public_files
+
+serve_public_files()
+```
+
+The routes take precedence over Chainlit's public-file route, so a package
+element replaces an application file with the same name; other application
+files are unaffected. They work with `chainlit run` and with `mount_chainlit`
+at any path. Browser scripts are served under `/public/chainlit-utils/`.
+Chainlit's `custom_js` accepts one URL, so the application selects a script in
+`.chainlit/config.toml`; to combine it with its own script, load one from the
+other.
 
 ## Chat helpers
 
@@ -168,6 +193,81 @@ The helper uploads each current Chainlit element through the OpenAI Files API
 and adds `input_file` parts to the latest user item. The effective Chainlit chat
 profile must have spontaneous uploads enabled.
 
+## Audio
+
+`chainlit_utils.openai.audio` turns Chainlit's microphone recording into text
+for the chat input and reads assistant answers aloud through any
+OpenAI-compatible audio API. The application keeps its models, voice, client,
+and Chainlit callbacks. Enable Chainlit's microphone, serve the package's
+browser files, and select the dictation script:
+
+```toml
+[features.audio]
+enabled = true
+
+[UI]
+custom_js = "/public/chainlit-utils/dictation.js"
+```
+
+```python
+import chainlit as cl
+
+from chainlit_utils.openai.audio import (
+    SPEECH_ACTION_NAME,
+    add_dictation_chunk,
+    end_dictation,
+    read_aloud,
+    send_speech_button,
+    start_dictation,
+)
+from chainlit_utils.public_files import serve_public_files
+
+serve_public_files()
+
+
+@cl.on_audio_start
+async def on_audio_start():
+    start_dictation()
+    return True
+
+
+@cl.on_audio_chunk
+async def on_audio_chunk(chunk: cl.InputAudioChunk):
+    add_dictation_chunk(chunk)
+
+
+@cl.on_audio_end
+async def on_audio_end():
+    await end_dictation(client=openai_client, model="gpt-4o-mini-transcribe")
+
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    answer = await cl.Message(content="...").send()
+    await send_speech_button(answer)
+
+
+@cl.action_callback(SPEECH_ACTION_NAME)
+async def on_speech(action: cl.Action):
+    return await read_aloud(
+        action, client=openai_client, model="gpt-4o-mini-tts", voice="alloy"
+    )
+```
+
+`end_dictation` sends the recording, a 24 kHz mono WAV of the PCM16 that
+Chainlit's recorder streams, to the transcription model. It appends the text to
+the chat input without sending it, so the user can edit it first, and reports
+an empty or failed transcription as a UI-only message.
+
+`send_speech_button` attaches the bundled `SpeechButton` element. The element
+asks `read_aloud` for one part of the answer at a time and plays the parts in
+order. The browser sends only the message ID and part index, and `read_aloud`
+reads only an assistant message in the current `cl.chat_context`, so the
+browser cannot request arbitrary speech. `speech_parts` splits an answer like
+Open WebUI's default read-aloud: it removes emojis and Markdown formatting,
+then joins short sentences into parts of at least four words and 50
+characters.
+
 ## Human-in-the-loop Responses
 
 `chainlit_utils.openai.hitl` validates and serializes exact Responses function-call
@@ -175,36 +275,62 @@ batches. `HitlWorkflow` persists the continuation in a model-context-excluded
 Chainlit message with a custom element. It then returns, so the pending review is
 ordinary persisted UI rather than a socket-bound ask coroutine.
 
-Configure one workflow with the application-owned tool, element, and action
-names plus small presentation and request callbacks:
+Configure one workflow with the application-owned tool and action names, a
+request callback, and a presentation. The bundled `HumanReview` element shows
+every pending call in one form; `HumanReviewForm` builds its props, prompt,
+and answer validation from a function that reads one call's payload. Serve the
+element with `serve_public_files()`:
 
 ```python
+import json
+
 import chainlit as cl
 
 from chainlit_utils.chat.hitl import HitlWorkflow
+from chainlit_utils.chat.human_review import (
+    HUMAN_REVIEW_ELEMENT_NAME,
+    HumanReview,
+    HumanReviewForm,
+)
+from chainlit_utils.public_files import serve_public_files
 
+serve_public_files()
+
+
+def review(call):
+    payload = json.loads(call.arguments)
+    return HumanReview(
+        prompt=payload["question"],
+        choices=tuple(payload.get("choices", ())),
+        allow_other=payload.get("allow_other") is True,
+    )
+
+
+form = HumanReviewForm(review)
 hitl = HitlWorkflow(
     "human_review",
     action_name="human_review_submit",
     continue_response=continue_response,
-    element_name="HumanReview",
-    prompt=prompt_for_calls,
+    element_name=HUMAN_REVIEW_ELEMENT_NAME,
+    prompt=form.prompt,
     publish_final=publish_final,
-    review=review_props,
-    validate_outputs=validate_outputs,
+    review=form.props,
+    validate_outputs=form.validate_outputs,
 )
 
 
 @cl.action_callback("human_review_submit")
 async def submit_review(action: cl.Action):
-    submission = ReviewSubmission.model_validate(action.payload)
-    await hitl.submit(
-        step_id=submission.step_id,
-        element_id=submission.element_id,
-        revision=submission.revision,
-        outputs=submission.outputs,
-    )
+    return await hitl.submit_action(action)
 ```
+
+The reviewer picks one of a review's `choices` or, when `allow_other` is set or
+there are no choices, writes an answer. `submit_action` returns the element's
+reply: `{"ok": True}`, or `{"ok": False, "error": message}` for an invalid or
+stale submission, which the element shows. A failed continuation is also logged
+and reported in the chat. An application with its own element passes its name
+and callbacks instead; the element reads the `_chainlit_utils_hitl` prop and
+submits its `step_id`, `element_id`, and `revision` with the `outputs`.
 
 Call `await hitl.publish(response, model_id=model_id)` when the tool appears and
 `await hitl.block_new_message(message)` before starting a new request. The
@@ -219,7 +345,7 @@ Chainlit natively restores the message and custom element when a persisted
 thread is opened. No `on_chat_end` cancellation, `on_chat_resume` recreation,
 session task ownership, reconnect timer, or `user_session` HITL cache is needed.
 The application callbacks still own the API request, final rendering, payload
-schema, review UI, and client credentials.
+schema, and client credentials.
 
 `HitlWorkflow` also normalizes the timestamp on a restored ledger message before
 updating it. Chainlit 2.12's official PostgreSQL layer hydrates `createdAt`
@@ -333,11 +459,13 @@ its URLs and secrets before constructing these services.
 ## Development
 
 The source modules are grouped by responsibility: `chat/` owns history,
-settings, and Chainlit HITL lifecycle helpers; `openai/` owns Responses
-rendering, function tools, Files, and protocol-level HITL integration; `sso/`
-owns OIDC clients, Chainlit login, and delegated-token storage.
+settings, the Chainlit HITL lifecycle, and its review form; `openai/` owns
+Responses rendering, function tools, Files, audio, and protocol-level HITL
+integration; `sso/` owns OIDC clients, Chainlit login, and delegated-token
+storage.
 `mcp.py` and `auth.py` own MCP tools and the authenticated-user identifier;
-`sessions.py` keeps reconnected WebSocket sessions.
+`sessions.py` keeps reconnected WebSocket sessions, and `public_files.py`
+serves the custom elements and browser scripts in `public/`.
 `db/schema.py` owns PostgreSQL schema migrations and loads its bundled SQL from
 `db/migrations/`. Import helpers from their concrete modules.
 

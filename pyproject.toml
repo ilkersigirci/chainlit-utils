@@ -1,7 +1,7 @@
 [project]
 name = "chainlit-utils"
 version = "0.1.0"
-description = "Reusable chat, OpenAI, MCP, OAuth, and persistence integrations for Chainlit"
+description = "Reusable chat, OpenAI, audio, MCP, OAuth, and persistence integrations for Chainlit"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -19,6 +19,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+audio = [
+    "emoji>=2,<3",
+]
 sso = [
     "authlib>=1.8,<2",
     "itsdangerous>=2.2,<3",

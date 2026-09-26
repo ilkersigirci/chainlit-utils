@@ -11,6 +11,7 @@ from typing import Any, Protocol, cast
 
 import chainlit as cl
 from openai.types.responses import Response, ResponseFunctionToolCall
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from chainlit_utils.chat.history import mark_model_context_excluded, send_ui_message
 from chainlit_utils.openai.hitl import (
@@ -31,6 +32,17 @@ HITL_CONTROL_PROP = "_chainlit_utils_hitl"
 
 class InvalidHitlSubmissionError(ValueError):
     """A browser submission does not match the current durable HITL state."""
+
+
+class _Submission(BaseModel):
+    """The untrusted action payload; references echo ``HITL_CONTROL_PROP``."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    step_id: str = Field(min_length=1)
+    element_id: str = Field(min_length=1)
+    revision: str = Field(min_length=1)
+    outputs: list[str] = Field(min_length=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +148,28 @@ class HitlWorkflow:
             "Resolve the pending interrupt before starting another request."
         )
         return True
+
+    async def submit_action(self, action: cl.Action) -> dict[str, object]:
+        """Handle a review element's action and return its ``callAction`` reply.
+
+        Register this for the workflow's action name. The reply is
+        ``{"ok": True}`` or ``{"ok": False, "error": message}``; the element
+        shows the message. A failed continuation is also logged and reported in
+        the chat.
+        """
+        try:
+            submission = _Submission.model_validate(action.payload)
+        except ValidationError:
+            return {"ok": False, "error": "Invalid human-review submission."}
+        try:
+            await self.submit(**submission.model_dump())
+        except InvalidHitlSubmissionError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:
+            logger.exception("Chainlit HITL continuation failed")
+            await send_ui_message(f"Response failed: {exc}")
+            return {"ok": False, "error": "The human review could not be submitted."}
+        return {"ok": True}
 
     async def submit(
         self,
