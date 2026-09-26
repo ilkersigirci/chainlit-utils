@@ -331,6 +331,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+audio = [
+    { name = "emoji" },
+]
 sso = [
     { name = "authlib" },
     { name = "itsdangerous" },
@@ -351,13 +354,14 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30.0" },
     { name = "authlib", marker = "extra == 'sso'", specifier = ">=1.8,<2" },
     { name = "chainlit", specifier = ">=2.12.0,<3" },
+    { name = "emoji", marker = "extra == 'audio'", specifier = ">=2,<3" },
     { name = "itsdangerous", marker = "extra == 'sso'", specifier = ">=2.2,<3" },
     { name = "mcp", specifier = ">=1.0,<2" },
     { name = "openai", specifier = ">=3.14.1,<4" },
     { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "pydantic-settings", specifier = ">=2.9.0" },
 ]
-provides-extras = ["sso"]
+provides-extras = ["audio", "sso"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -519,6 +523,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/49/85/12f0a49a7c4ffb70572b6c2ef13c90c88fd190debda93b23f026b25f9634/deprecated-1.3.1.tar.gz", hash = "sha256:b1b50e0ff0c1fddaa5708a2c6b0a6588bb09b892825ab2b214ac9ea9d92a5223", size = 2932523, upload-time = "2025-10-30T08:19:02.757Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/84/d0/205d54408c08b13550c733c4b85429e7ead111c7f0014309637425520a9a/deprecated-1.3.1-py2.py3-none-any.whl", hash = "sha256:597bfef186b6f60181535a29fbe44865ce137a5079f295b479886c82729d5f3f", size = 11298, upload-time = "2025-10-30T08:19:00.758Z" },
+]
+
+[[package]]
+name = "emoji"
+version = "2.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/34/01/a25a9c13e2f8945d06b219e08e88a5dd8a504ad1a79f872f25d6814f498c/emoji-2.16.0.tar.gz", hash = "sha256:ff9e9b1c48389ef78ed1787e7693c555e84e6bb9bac16be1fd65e1616dbf80c8", size = 617905, upload-time = "2026-09-16T19:47:57.051Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/8a/75e3177f374877b19dd3112820b071836ad1100f9f58424630b4783519bc/emoji-2.16.0-py3-none-any.whl", hash = "sha256:c4230d80640def9071599ff56b1b5950fe13a2a94c0da98c5deab12431b24330", size = 610912, upload-time = "2026-09-16T19:47:55.507Z" },
 ]
 
 [[package]]

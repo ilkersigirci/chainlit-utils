@@ -2,13 +2,13 @@ set default-list
 set positional-arguments
 set shell := ["bash", "--norc", "-euo", "pipefail", "-c"]
 
-# Install the locked development environment with SSO support.
+# Install the locked development environment with all extras.
 install *args:
-    uv sync --locked --extra sso "$@"
+    uv sync --locked --all-extras "$@"
 
 # Run the regular test suite.
 test *args:
-    uv run --locked --extra sso pytest "$@"
+    uv run --locked --all-extras pytest "$@"
 
 # Run the PostgreSQL integration suite using TEST_CHAINLIT_DATABASE_URL.
 test-postgres *args:
@@ -22,7 +22,7 @@ lint:
 
 # Type-check the package source.
 type-check:
-    uv run --locked --extra sso ty check src
+    uv run --locked --all-extras ty check src
 
 # Run all regular tests and static checks.
 check: lint type-check test
