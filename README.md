@@ -338,8 +338,9 @@ custom element submits its opaque step, element, and revision references through
 Chainlit's `callAction`; model IDs, response IDs, function calls, and the
 expected element ID are always read from trusted current-thread message
 metadata. Each accepted action advances one Responses transition. A later
-interrupt updates the same persisted form; a terminal response marks the ledger
-complete and removes it.
+interrupt updates the same persisted form. Any other response marks the ledger
+complete, removes the form, and goes to `publish_final`, which renders the
+answer or runs the client function calls it contains.
 
 Chainlit natively restores the message and custom element when a persisted
 thread is opened. No `on_chat_end` cancellation, `on_chat_resume` recreation,

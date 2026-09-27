@@ -288,7 +288,9 @@ class HitlWorkflow:
         element: cl.CustomElement | None = None,
     ) -> PendingHitl | None:
         calls = function_calls(response)
-        if calls:
+        # Only this workflow's tool pauses for review. Any other response,
+        # including client function calls, belongs to publish_final.
+        if any(call.name == self._codec.tool_name for call in calls):
             continuation = self._codec.continuation(
                 model_id=model_id,
                 response_id=response.id,
