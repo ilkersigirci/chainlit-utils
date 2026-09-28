@@ -189,6 +189,35 @@ async def test_submit_completes_one_continuation_and_removes_the_control(
     publish_final.assert_awaited_once_with(final)
 
 
+async def test_client_function_calls_after_review_go_to_publish_final(
+    chainlit_context,
+) -> None:
+    client_call = function_call("lookup").model_copy(update={"name": "lookup"})
+    after_review = response("resp_lookup", client_call)
+    instance, _, publish_final = workflow(
+        continue_response=AsyncMock(return_value=after_review)
+    )
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
+    pending.message.elements[0].remove = AsyncMock()  # type: ignore[method-assign]
+
+    result = await instance.submit(
+        step_id=review_control["step_id"],
+        element_id=review_control["element_id"],
+        revision=review_control["revision"],
+        outputs=["approve"],
+    )
+
+    assert result is None
+    ledger = pending.message.metadata[hitl.HITL_LEDGER_METADATA_KEY]
+    assert ledger["status"] == "completed"
+    publish_final.assert_awaited_once_with(after_review)
+
+
 async def test_chained_interrupt_updates_the_same_element_one_action_at_a_time(
     chainlit_context,
 ) -> None:
