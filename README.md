@@ -141,6 +141,32 @@ for an existing application without changing call sites:
 CHAINLIT_UTILS_MODEL_CONTEXT_EXCLUDED_KEY=my_app.exclude_from_model_context
 ```
 
+## Streaming messages
+
+Fast token streams can overwhelm Chainlit's browser with one WebSocket event
+and Markdown render per token, delaying the Stop button. `MessageStream`
+combines deltas into native `Message.stream_token()` calls about every 50 ms
+while tokens arrive, with the first token sent immediately:
+
+```python
+import chainlit as cl
+
+from chainlit_utils.chat.streaming import MessageStream
+
+message = cl.Message(content="")
+stream = MessageStream(message)
+async for token in tokens:
+    await stream.stream_token(token)
+await stream.flush()
+await message.send()
+```
+
+Flush at text boundaries too, before waiting for tool work or another output.
+The helper yields to asyncio on each token so Stop can cancel a buffered burst.
+On cancellation, discard the buffer; `message.content` holds the text already
+sent. The application owns closing the upstream stream and preserving or
+excluding the partial message from model context.
+
 ## Chat settings
 
 ```python
