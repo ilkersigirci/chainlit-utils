@@ -28,7 +28,7 @@ async def test_message_without_attachments_is_unchanged() -> None:
     client = SimpleNamespace(files=SimpleNamespace(create=AsyncMock()))
 
     result = await files.with_response_file_parts(
-        messages, SimpleNamespace(elements=[]), client=client
+        messages, SimpleNamespace(elements=[], metadata={}), client=client
     )
 
     assert result is messages
@@ -56,7 +56,9 @@ async def test_attachments_are_uploaded_and_added_to_the_latest_user_item(
                 SimpleNamespace(
                     path=str(path), name="renamed.pdf", mime="application/pdf"
                 )
-            ]
+            ],
+            metadata={},
+            update=AsyncMock(),
         ),
         client=client,
         extra_query={"provider": "files"},
@@ -91,7 +93,11 @@ async def test_file_only_input_gets_a_user_item(
 
     result = await files.with_response_file_parts(
         [],
-        SimpleNamespace(elements=[SimpleNamespace(path=str(path))]),
+        SimpleNamespace(
+            elements=[SimpleNamespace(path=str(path))],
+            metadata={},
+            update=AsyncMock(),
+        ),
         client=client,
     )
 
@@ -112,7 +118,63 @@ async def test_disabled_upload_rejects_before_opening_the_file(
     with pytest.raises(ValueError, match="does not support file inputs"):
         await files.with_response_file_parts(
             [],
-            SimpleNamespace(elements=[SimpleNamespace(path="missing")]),
+            SimpleNamespace(elements=[SimpleNamespace(path="missing")], metadata={}),
             client=client,
         )
     client.files.create.assert_not_awaited()
+
+
+async def test_uploaded_file_ids_are_saved_on_the_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "report.pdf"
+    path.write_bytes(b"report")
+    client = SimpleNamespace(
+        files=SimpleNamespace(
+            create=AsyncMock(return_value=SimpleNamespace(id="file-123"))
+        )
+    )
+    message = SimpleNamespace(
+        elements=[SimpleNamespace(path=str(path))],
+        metadata={"other": True},
+        update=AsyncMock(),
+    )
+    _set_upload_enabled(monkeypatch, True)
+
+    await files.with_response_file_parts([], message, client=client)
+
+    assert message.metadata == {
+        "other": True,
+        files.FILE_IDS_METADATA_KEY: ["file-123"],
+    }
+    message.update.assert_awaited_once()
+
+
+async def test_resumed_message_reuses_saved_file_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Chainlit rebuilds resumed messages from metadata without their elements.
+    client = SimpleNamespace(files=SimpleNamespace(create=AsyncMock()))
+    message = SimpleNamespace(
+        elements=[],
+        metadata={files.FILE_IDS_METADATA_KEY: ["file-123"]},
+        update=AsyncMock(),
+    )
+    _set_upload_enabled(monkeypatch, True)
+
+    result = await files.with_response_file_parts(
+        [{"role": "user", "content": "Summarize"}], message, client=client
+    )
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Summarize"},
+                {"type": "input_file", "file_id": "file-123"},
+            ],
+        }
+    ]
+    client.files.create.assert_not_awaited()
+    message.update.assert_not_awaited()

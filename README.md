@@ -218,8 +218,10 @@ input_items = await with_response_file_parts(
 ```
 
 The helper uploads each current Chainlit element through the OpenAI Files API
-and adds `input_file` parts to the latest user item. The effective Chainlit chat
-profile must have spontaneous uploads enabled.
+and adds `input_file` parts to the latest user item. It saves the file IDs in the
+message metadata, so an edited message sends the same files again, including
+after its thread resumes. The effective Chainlit chat profile must have
+spontaneous uploads enabled.
 
 ## Audio
 
