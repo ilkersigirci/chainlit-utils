@@ -68,24 +68,24 @@ async def test_ongoing_stream_flushes_as_tokens_arrive(
     assert session.emit.await_args_list[-1].args[1]["token"] == " two three"
 
 
-async def test_stop_interrupts_a_buffered_burst_without_sending_pending_text(
+async def test_stop_interrupts_a_buffered_burst_and_keeps_received_text(
     session: WebsocketSession,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(streaming, "monotonic", lambda: 10.0)
     message = cl.Message(content="")
-    stream = streaming.MessageStream(message)
     pending = asyncio.Event()
     consumed = 0
 
     async def produce() -> None:
         nonlocal consumed
-        await stream.stream_token("Visible")
-        await stream.stream_token(" pending")
-        pending.set()
-        for _ in range(1000):
-            await stream.stream_token(" extra")
-            consumed += 1
+        async with streaming.MessageStream(message) as stream:
+            await stream.stream_token("Visible")
+            await stream.stream_token(" pending")
+            pending.set()
+            for _ in range(1000):
+                await stream.stream_token(" extra")
+                consumed += 1
 
     async with asyncio.TaskGroup() as tasks:
         task = tasks.create_task(produce())
@@ -96,5 +96,4 @@ async def test_stop_interrupts_a_buffered_burst_without_sending_pending_text(
                 await task
 
     assert consumed < 1000
-    assert message.content == "Visible"
-    assert session.emit.await_count == 1
+    assert message.content == "Visible pending" + " extra" * consumed

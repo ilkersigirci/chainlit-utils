@@ -131,7 +131,9 @@ async def report_error(error: Exception):
 ```
 
 `text_only_chat_messages` uses Chainlit's native role/content projection. It is
-not a lossless tool-call ledger.
+not a lossless tool-call ledger. It omits the "Task manually stopped." notice
+that Chainlit's Stop button sends, so a stopped answer the application keeps
+remains the last assistant turn.
 
 UI-only messages use the
 `chainlit_utils.exclude_from_model_context` metadata key by default. Override it
@@ -154,17 +156,17 @@ import chainlit as cl
 from chainlit_utils.chat.streaming import MessageStream
 
 message = cl.Message(content="")
-stream = MessageStream(message)
-async for token in tokens:
-    await stream.stream_token(token)
-await stream.flush()
+async with MessageStream(message) as stream:
+    async for token in tokens:
+        await stream.stream_token(token)
 await message.send()
 ```
 
-Flush at text boundaries too, before waiting for tool work or another output.
-The helper yields to asyncio on each token so Stop can cancel a buffered burst.
-On cancellation, discard the buffer; `message.content` holds the text already
-sent. The application owns closing the upstream stream and preserving or
+Leaving the `async with` block sends the batch not yet shown, including on Stop
+or a failure, so `message.content` keeps every token received. Call
+`stream.flush()` at text boundaries too, before waiting for tool work or another
+output. The helper yields to asyncio on each token so Stop can cancel a buffered
+burst. The application owns closing the upstream stream and preserving or
 excluding the partial message from model context.
 
 ## Chat settings

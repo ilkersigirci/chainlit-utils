@@ -2,7 +2,11 @@ from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, Mock
 
+import chainlit.socket as socket
 import pytest
+from chainlit.chat_context import chat_contexts
+from chainlit.context import init_ws_context
+from chainlit.session import WebsocketSession
 
 from chainlit_utils.chat import history
 from chainlit_utils.settings import Settings
@@ -60,7 +64,6 @@ async def test_text_only_chat_message_policy(
     included_messages = [
         history.cl.Message(content="User turn", type="user_message"),
         history.cl.Message(content="Model turn"),
-        history.cl.Message(content="Task manually stopped."),
     ]
     excluded_messages = [
         history.cl.Message(content="Partial assistant output"),
@@ -83,8 +86,35 @@ async def test_text_only_chat_message_policy(
     assert history.text_only_chat_messages() == [
         {"role": "user", "content": "User turn"},
         {"role": "assistant", "content": "Model turn"},
-        {"role": "assistant", "content": "Task manually stopped."},
     ]
+
+
+async def test_stopped_answer_stays_the_last_model_turn() -> None:
+    session = WebsocketSession(
+        id="stopped-session",
+        socket_id="stopped-socket",
+        emit=AsyncMock(),
+        emit_call=AsyncMock(),
+        user_env={},
+        client_type="webapp",
+    )
+    try:
+        init_ws_context(session)
+        history.cl.chat_context.add(
+            history.cl.Message(content="Tell me a story.", type="user_message")
+        )
+        # Chainlit's Stop handler sends its notice before the cancelled task
+        # saves the partial answer.
+        await socket.stop(session.socket_id)
+        history.cl.chat_context.add(history.cl.Message(content="Once upon"))
+
+        assert history.text_only_chat_messages() == [
+            {"role": "user", "content": "Tell me a story."},
+            {"role": "assistant", "content": "Once upon"},
+        ]
+    finally:
+        chat_contexts.pop(session.id, None)
+        await session.delete()
 
 
 async def test_custom_metadata_key_preserves_existing_threads(
