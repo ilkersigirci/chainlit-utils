@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import chainlit as cl
 from chainlit.config import (
     ChainlitConfigOverrides,
     FeaturesSettings,
@@ -15,6 +16,9 @@ from openai import AsyncOpenAI
 
 if TYPE_CHECKING:
     from chainlit.session import WebsocketSession
+
+# Chainlit keeps message metadata, but not elements, when it resumes a thread.
+FILE_IDS_METADATA_KEY = "chainlit_utils.file_ids"
 
 
 def file_upload_overrides(enabled: bool) -> ChainlitConfigOverrides:
@@ -28,13 +32,17 @@ def file_upload_overrides(enabled: bool) -> ChainlitConfigOverrides:
 
 async def with_response_file_parts(
     input_items: list[dict[str, Any]],
-    message: object,
+    message: cl.Message,
     *,
     client: AsyncOpenAI,
     extra_query: Mapping[str, object] | None = None,
 ) -> list[dict[str, Any]]:
-    """Upload current attachments and add native Responses input-file parts."""
-    file_ids = await _upload_file_ids(
+    """Add the message's attachments as native Responses input-file parts.
+
+    The first request uploads them and saves their file IDs on the message, so
+    an edited or resumed message sends the same files again.
+    """
+    file_ids = await _message_file_ids(
         message,
         client=client,
         extra_query=extra_query,
@@ -72,20 +80,24 @@ async def with_response_file_parts(
     ]
 
 
-async def _upload_file_ids(
-    message: object,
+async def _message_file_ids(
+    message: cl.Message,
     *,
     client: AsyncOpenAI,
     extra_query: Mapping[str, object] | None,
 ) -> list[str]:
-    elements = getattr(message, "elements", None)
-    if not isinstance(elements, list) or not elements:
+    metadata = message.metadata or {}
+    saved_file_ids = metadata.get(FILE_IDS_METADATA_KEY)
+    if not saved_file_ids and not message.elements:
         return []
     if not session_file_upload_enabled():
         raise ValueError("The selected chat profile does not support file inputs.")
 
+    if saved_file_ids:
+        return list(saved_file_ids)
+
     file_ids = []
-    for element in elements:
+    for element in message.elements:
         path = getattr(element, "path", None)
         if not isinstance(path, str) or not path:
             continue
@@ -98,6 +110,9 @@ async def _upload_file_ids(
                 extra_query=extra_query,
             )
         file_ids.append(uploaded.id)
+    if file_ids:
+        message.metadata = {**metadata, FILE_IDS_METADATA_KEY: file_ids}
+        await message.update()
     return file_ids
 
 
@@ -109,6 +124,7 @@ def session_file_upload_enabled() -> bool:
 
 
 __all__ = [
+    "FILE_IDS_METADATA_KEY",
     "file_upload_overrides",
     "session_file_upload_enabled",
     "with_response_file_parts",
