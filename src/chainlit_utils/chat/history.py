@@ -8,6 +8,10 @@ from openai.types.chat import ChatCompletionMessageParam
 
 from chainlit_utils.settings import settings
 
+# Chainlit's Stop handler sends this assistant message before it cancels the
+# task. It reports a UI action, so the stopped answer stays the last model turn.
+_CHAINLIT_STOP_NOTICE = "Task manually stopped."
+
 
 def mark_model_context_excluded(message: cl.Message | cl.AskActionMessage) -> None:
     """Keep a UI-only message out of subsequent model requests."""
@@ -41,7 +45,7 @@ def text_only_chat_messages() -> list[ChatCompletionMessageParam]:
 
     This transcript is not a lossless OpenAI protocol ledger. Chainlit's native
     projection does not retain fields such as ``tool_calls`` or ``tool_call_id``.
-    UI-only, failed, and cancelled assistant messages are omitted.
+    UI-only and failed messages, including Chainlit's Stop notice, are omitted.
     """
     chainlit_messages = cl.chat_context.get()
     openai_messages = cl.chat_context.to_openai()
@@ -52,8 +56,15 @@ def text_only_chat_messages() -> list[ChatCompletionMessageParam]:
             openai_messages,
             strict=True,
         )
-        if not chainlit_message.is_error
-        and not (chainlit_message.metadata or {}).get(
-            settings.MODEL_CONTEXT_EXCLUDED_KEY
-        )
+        if _is_model_context(chainlit_message)
     ]
+
+
+def _is_model_context(message: cl.Message) -> bool:
+    if message.is_error or (message.metadata or {}).get(
+        settings.MODEL_CONTEXT_EXCLUDED_KEY
+    ):
+        return False
+    return not (
+        message.type == "assistant_message" and message.content == _CHAINLIT_STOP_NOTICE
+    )
