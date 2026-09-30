@@ -191,8 +191,12 @@ responsible for full schema validation.
 
 `chainlit_utils.openai.responses` converts Chainlit's text transcript to
 Responses input, separates final-answer text from commentary, creates clickable
-citation elements, and validates terminal response status. `CommentaryTaskList`
-renders streamed commentary as Chainlit tasks.
+citation elements, and validates terminal response status. `CommentarySteps`
+renders streamed commentary as native Chainlit steps; `CommentaryTaskList`
+renders it as one task list. Both expose `add(text)`, `complete()`, and `stop()`:
+each new status completes the prior one, and stopping marks the active status
+as failed. Steps require `[UI] cot = "tool_call"` or `"full"` in Chainlit's
+configuration. Neither renderer adds commentary to the chat transcript.
 
 `chainlit_utils.openai.tools` selects client-owned function calls, builds their
 outputs, and assembles stateless continuation input. Its `function_call_output`

@@ -1,6 +1,8 @@
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from chainlit.config import config
+from chainlit.context import init_http_context
 from openai.types.responses import (
     Response,
     ResponseOutputMessage,
@@ -126,3 +128,51 @@ async def test_commentary_task_list_completes_previous_tasks(
         responses.cl.TaskStatus.DONE,
     ]
     assert task_list.status == "Done"
+
+
+@pytest.mark.parametrize("stopped", [False, True], ids=["completed", "stopped"])
+async def test_commentary_steps_show_progress_and_finish_without_chat_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    stopped: bool,
+) -> None:
+    context = init_http_context()
+    monkeypatch.setattr(config.ui, "cot", "tool_call")
+    sent = AsyncMock()
+    updated = AsyncMock()
+    monkeypatch.setattr(context.emitter, "send_step", sent)
+    monkeypatch.setattr(context.emitter, "update_step", updated)
+    renderer = responses.CommentarySteps()
+
+    await renderer.complete()
+    await renderer.stop()
+    await renderer.add("")
+    sent.assert_not_called()
+    updated.assert_not_called()
+
+    await renderer.add("Searching")
+    await renderer.add("Composing")
+    if stopped:
+        await renderer.stop()
+    else:
+        await renderer.complete()
+    await renderer.complete()
+    await renderer.stop()
+
+    searching, composing = [call.args[0] for call in sent.call_args_list]
+    assert [step["name"] for step in (searching, composing)] == [
+        "Searching",
+        "Composing",
+    ]
+    assert all(
+        step["type"] == "tool" and step["start"] and step["end"] is None
+        for step in (searching, composing)
+    )
+    completed, last = [call.args[0] for call in updated.call_args_list]
+    assert completed["id"] == searching["id"]
+    assert completed["end"] >= completed["start"]
+    assert completed["isError"] is False
+    assert last["id"] == composing["id"]
+    assert last["end"] >= last["start"]
+    assert last["isError"] is stopped
+    assert last["output"] == ("Stopped" if stopped else "")
+    assert responses.cl.chat_context.get() == []

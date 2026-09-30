@@ -5,6 +5,7 @@ from typing import Any
 
 import chainlit as cl
 from chainlit.element import Element
+from chainlit.utils import utc_now
 from openai.types.responses import Response
 
 
@@ -48,6 +49,48 @@ class CommentaryTaskList:
         self._active_task = None
         self._task_list.status = "Stopped"
         await self._task_list.send()
+
+
+class CommentarySteps:
+    """Render streamed commentary as sequential native Chainlit steps."""
+
+    def __init__(self) -> None:
+        self._active_step: cl.Step | None = None
+
+    async def add(self, content: str) -> None:
+        """Finish the previous status and show the latest one as running."""
+        if not content:
+            return
+        await self.complete()
+        parent = cl.context.current_step
+        step = cl.Step(
+            name=content,
+            type="tool",
+            parent_id=parent.id if parent is not None else None,
+            show_input=False,
+        )
+        step.start = step.created_at
+        self._active_step = step
+        await step.send()
+
+    async def complete(self) -> None:
+        """Finish the active status after the Responses loop succeeds."""
+        await self._finish(stopped=False)
+
+    async def stop(self) -> None:
+        """Mark the active status as failed when the Responses loop stops early."""
+        await self._finish(stopped=True)
+
+    async def _finish(self, *, stopped: bool) -> None:
+        step = self._active_step
+        if step is None:
+            return
+        step.end = utc_now()
+        step.is_error = stopped
+        if stopped:
+            step.output = "Stopped"
+        await step.update()
+        self._active_step = None
 
 
 def response_input(messages: Sequence[Mapping[str, object]]) -> list[dict[str, Any]]:
@@ -116,6 +159,7 @@ def raise_for_response(response: Response) -> None:
 
 
 __all__ = [
+    "CommentarySteps",
     "CommentaryTaskList",
     "citation_elements",
     "final_answer",
