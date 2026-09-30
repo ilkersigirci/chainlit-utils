@@ -52,24 +52,31 @@ class CommentaryTaskList:
 
 
 class CommentarySteps:
-    """Render streamed commentary as sequential native Chainlit steps."""
+    """Render commentary in one native step with expandable status history."""
 
     def __init__(self) -> None:
         self._active_step: cl.Step | None = None
 
     async def add(self, content: str) -> None:
-        """Finish the previous status and show the latest one as running."""
+        """Update the status label and append it to the step's history."""
         if not content:
             return
-        await self.complete()
+        if self._active_step is not None:
+            self._active_step.name = content
+            self._active_step.output += f"\n- {content}"
+            await self._active_step.update()
+            return
+
         parent = cl.context.current_step
         step = cl.Step(
             name=content,
             type="tool",
             parent_id=parent.id if parent is not None else None,
             show_input=False,
+            default_open=False,
         )
         step.start = step.created_at
+        step.output = f"- {content}"
         self._active_step = step
         await step.send()
 
@@ -88,7 +95,7 @@ class CommentarySteps:
         step.end = utc_now()
         step.is_error = stopped
         if stopped:
-            step.output = "Stopped"
+            step.output += "\n- Stopped"
         await step.update()
         self._active_step = None
 

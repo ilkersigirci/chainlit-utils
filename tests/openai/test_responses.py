@@ -158,21 +158,21 @@ async def test_commentary_steps_show_progress_and_finish_without_chat_messages(
     await renderer.complete()
     await renderer.stop()
 
-    searching, composing = [call.args[0] for call in sent.call_args_list]
-    assert [step["name"] for step in (searching, composing)] == [
-        "Searching",
-        "Composing",
-    ]
-    assert all(
-        step["type"] == "tool" and step["start"] and step["end"] is None
-        for step in (searching, composing)
-    )
-    completed, last = [call.args[0] for call in updated.call_args_list]
-    assert completed["id"] == searching["id"]
-    assert completed["end"] >= completed["start"]
-    assert completed["isError"] is False
-    assert last["id"] == composing["id"]
+    sent.assert_awaited_once()
+    first = sent.call_args.args[0]
+    progress, last = [call.args[0] for call in updated.call_args_list]
+    assert first["name"] == "Searching"
+    assert first["output"] == "- Searching"
+    assert first["type"] == "tool"
+    assert first["start"] and first["end"] is None
+    assert first["defaultOpen"] is False
+    assert progress["id"] == first["id"] == last["id"]
+    assert progress["name"] == last["name"] == "Composing"
+    assert progress["output"] == "- Searching\n- Composing"
+    assert progress["end"] is None
     assert last["end"] >= last["start"]
     assert last["isError"] is stopped
-    assert last["output"] == ("Stopped" if stopped else "")
+    assert last["output"] == "- Searching\n- Composing" + (
+        "\n- Stopped" if stopped else ""
+    )
     assert responses.cl.chat_context.get() == []
