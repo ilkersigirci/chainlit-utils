@@ -1,23 +1,63 @@
 """Bridge Chainlit-managed MCP sessions to OpenAI Responses tools."""
 
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import chainlit as cl
+import chainlit.mcp
+import httpx
 from chainlit.config import StreamableHttpMcpServer
-from chainlit.mcp import McpConnection
+from chainlit.mcp import McpConnection, McpHttpClientFactory
 from mcp import ClientSession
 from mcp.types import Tool
 from openai.types.responses import FunctionToolParam, ResponseFunctionToolCall
 
 from chainlit_utils.openai.tools import function_call_output
 
+# Resolved for each request to the server URL, as the OpenAI SDK resolves a
+# callable api_key.
+_api_keys: dict[httpx.URL, Callable[[], Awaitable[str]]] = {}
+
 
 @dataclass(frozen=True)
 class _ConnectedServer:
     session: ClientSession
     tools: tuple[Tool, ...]
+
+
+class _ApiKeyAuth(httpx.Auth):
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        api_key = _api_keys.get(request.url)
+        if api_key is not None:
+            request.headers["Authorization"] = f"Bearer {await api_key()}"
+        yield request
+
+
+_chainlit_client_factory = chainlit.mcp.make_mcp_http_client_factory
+
+
+def _client_factory_with_api_keys(*args: Any, **kwargs: Any) -> McpHttpClientFactory:
+    """
+    Wrap Chainlit's MCP HTTP client factory to resolve callable API keys.
+
+    Chainlit has no hook for per-request MCP headers, but it builds every
+    connection's client through this factory at connect time, in a task that
+    runs in the connecting user's session context.
+    """
+    factory = _chainlit_client_factory(*args, **kwargs)
+
+    def with_api_keys(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        return factory(headers=headers, timeout=timeout, auth=auth or _ApiKeyAuth())
+
+    return with_api_keys
 
 
 class McpTools:
@@ -34,13 +74,30 @@ class McpTools:
         url: str,
         *,
         headers: Mapping[str, str] | None = None,
+        api_key: str | Callable[[], Awaitable[str]] | None = None,
     ) -> StreamableHttpMcpServer:
-        """Build a Chainlit streamable-HTTP server configuration."""
+        """
+        Build a Chainlit streamable-HTTP server configuration.
+
+        ``api_key`` is sent as a bearer token, like the OpenAI SDK's: a string
+        for the whole session, or an async callable that returns the token for
+        each request, such as the signed-in user's refreshed delegated token.
+        """
+        server_headers = dict(headers or {})
+        if api_key is not None and any(
+            name.lower() == "authorization" for name in server_headers
+        ):
+            raise ValueError("Pass the MCP credential as api_key or headers.")
+        if isinstance(api_key, str):
+            server_headers["Authorization"] = f"Bearer {api_key}"
+        elif api_key is not None:
+            _api_keys[httpx.URL(url)] = api_key
+            chainlit.mcp.make_mcp_http_client_factory = _client_factory_with_api_keys  # ty: ignore[invalid-assignment] - Replacing Chainlit's function is the intent.
         return StreamableHttpMcpServer(
             name=self.server_name,
             type="streamable-http",
             url=url,
-            headers=dict(headers or {}),
+            headers=server_headers,
         )
 
     async def connect(

@@ -398,9 +398,9 @@ state that may no longer be safe to resume.
 
 ## MCP tools
 
-`McpTools` keeps the MCP session and discovered tool schemas in the current
-Chainlit user session. An application chooses the server name and URL and wires
-the native Chainlit callbacks:
+`McpTools` keeps the MCP session that Chainlit's native MCP control connects,
+and its discovered tool schemas, in the current Chainlit user session. An
+application chooses the server name and URL and wires the native callbacks:
 
 ```python
 import chainlit as cl
@@ -410,10 +410,7 @@ from chainlit_utils.mcp import McpTools
 
 mcp_tools = McpTools("company-tools")
 config.features.mcp.servers = [
-    mcp_tools.server(
-        "https://mcp.example/tools",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
+    mcp_tools.server("https://mcp.example/tools", api_key=oauth.credential)
 ]
 
 
@@ -426,6 +423,15 @@ async def on_mcp_connect(connection, session):
 async def on_mcp_disconnect(name, session):
     await mcp_tools.disconnect(name, session)
 ```
+
+`api_key` takes the same values as the OpenAI SDK's, so one credential can
+serve both clients. A string is a bearer token that Chainlit sends for the whole
+session; pass other static credentials, such as `X-API-Key`, in `headers`. An
+async callable, such as `oauth.credential`, returns the bearer token for each
+request, so the connection acts for the signed-in user with a refreshed
+delegated token. Chainlit has no hook for that, so `chainlit_utils` wraps its
+MCP HTTP client factory; a contract test fails when a Chainlit upgrade changes
+how connections build their clients.
 
 Pass `mcp_tools.response_tools()` to a Responses request. When the model returns
 a function call, `await mcp_tools.execute(call)` validates that the tool was
