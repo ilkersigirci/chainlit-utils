@@ -56,11 +56,12 @@ def text_only_chat_messages() -> list[ChatCompletionMessageParam]:
             openai_messages,
             strict=True,
         )
-        if _is_model_context(chainlit_message)
+        if is_model_context(chainlit_message)
     ]
 
 
-def _is_model_context(message: cl.Message) -> bool:
+def is_model_context(message: cl.Message) -> bool:
+    """Return whether a message belongs in later model requests."""
     if message.is_error or (message.metadata or {}).get(
         settings.MODEL_CONTEXT_EXCLUDED_KEY
     ):

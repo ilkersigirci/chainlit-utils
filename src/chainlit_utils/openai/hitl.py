@@ -2,10 +2,10 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from openai.types.responses import ResponseFunctionToolCall
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from chainlit_utils.openai.tools import function_call_output
 
@@ -61,6 +61,16 @@ class _PendingLedger(_LedgerModel):
 class _CompletedLedger(_LedgerModel):
     schema_version: Literal[2]
     status: Literal["completed"]
+    # The answered batch, which later requests replay. Ledgers completed before
+    # answers were kept have none.
+    function_calls: list[_PersistedFunctionCall] = Field(default_factory=list)
+    outputs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _one_output_per_call(self) -> Self:
+        if len(self.outputs) != len(self.function_calls):
+            raise ValueError("Every answered HITL function call requires one output.")
+        return self
 
 
 class HitlLedgerCodec:
@@ -85,14 +95,7 @@ class HitlLedgerCodec:
                 "status": "pending",
                 "model_id": model_id,
                 "response_id": response_id,
-                "function_calls": [
-                    call.model_dump(
-                        mode="json",
-                        by_alias=True,
-                        exclude_none=True,
-                    )
-                    for call in function_calls
-                ],
+                "function_calls": [_dump_call(call) for call in function_calls],
             }
         )
 
@@ -108,23 +111,51 @@ class HitlLedgerCodec:
                 "model_id": continuation.model_id,
                 "response_id": continuation.response_id,
                 "function_calls": [
-                    call.model_dump(
-                        mode="json",
-                        by_alias=True,
-                        exclude_none=True,
-                    )
-                    for call in continuation.function_calls
+                    _dump_call(call) for call in continuation.function_calls
                 ],
             }
         )
         return ledger.model_dump(mode="json", by_alias=True, exclude_none=True)
 
-    def completed_metadata(self) -> dict[str, object]:
-        """Encode the terminal marker that prevents older pending replay."""
-        return _CompletedLedger(
-            schema_version=HITL_LEDGER_SCHEMA_VERSION,
-            status="completed",
-        ).model_dump(mode="json")
+    def completed_metadata(
+        self,
+        continuation: HitlContinuation,
+        outputs: Sequence[str],
+    ) -> dict[str, object]:
+        """Encode the answered batch, which also prevents older pending replay."""
+        try:
+            ledger = _CompletedLedger.model_validate(
+                {
+                    "schema_version": HITL_LEDGER_SCHEMA_VERSION,
+                    "status": "completed",
+                    "function_calls": [
+                        _dump_call(call) for call in continuation.function_calls
+                    ],
+                    "outputs": list(outputs),
+                }
+            )
+        except ValidationError as exc:
+            raise InvalidHitlLedgerError("Completed HITL ledger is invalid.") from exc
+        return ledger.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+    def answered_input(self, raw_ledger: object) -> list[dict[str, Any]]:
+        """Return the Responses items that replay a completed ledger's batch.
+
+        Like a stateless transcript, they are the function calls followed by
+        their outputs. A pending ledger, or one completed before answers were
+        kept, replays nothing.
+        """
+        if self.decode(raw_ledger) is not None:
+            return []
+        ledger = _CompletedLedger.model_validate(raw_ledger)
+        calls = _sdk_calls(ledger.function_calls)
+        return [
+            *(_dump_call(call) for call in calls),
+            *(
+                function_call_output(call, output)
+                for call, output in zip(calls, ledger.outputs, strict=True)
+            ),
+        ]
 
     def decode(self, raw_ledger: object) -> HitlContinuation | None:
         """Decode one strict ledger value; completed values return ``None``."""
@@ -148,16 +179,7 @@ class HitlLedgerCodec:
 
     def _decode_pending(self, raw_ledger: object) -> HitlContinuation:
         ledger = self._validate_pending(raw_ledger)
-        calls = tuple(
-            ResponseFunctionToolCall.model_validate(
-                call.model_dump(
-                    mode="python",
-                    by_alias=True,
-                    exclude_none=True,
-                )
-            )
-            for call in ledger.function_calls
-        )
+        calls = _sdk_calls(ledger.function_calls)
         unexpected_tools = sorted(
             {call.name for call in calls if call.name != self.tool_name}
         )
@@ -182,6 +204,21 @@ class HitlLedgerCodec:
             raise InvalidHitlLedgerError(
                 "HITL ledger continuation is invalid."
             ) from exc
+
+
+def _dump_call(call: ResponseFunctionToolCall) -> dict[str, Any]:
+    return call.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+
+def _sdk_calls(
+    calls: Sequence[_PersistedFunctionCall],
+) -> tuple[ResponseFunctionToolCall, ...]:
+    return tuple(
+        ResponseFunctionToolCall.model_validate(
+            call.model_dump(mode="python", by_alias=True, exclude_none=True)
+        )
+        for call in calls
+    )
 
 
 def function_call_outputs(

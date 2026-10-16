@@ -76,18 +76,15 @@ export default function HumanReview() {
         {reviews.map((review, index) => {
           const choices = Array.isArray(review.choices) ? review.choices : []
           const allowOther = review.allow_other === true || choices.length === 0
-          const prompt =
-            typeof review.prompt === "string"
-              ? review.prompt
-              : "Human input required."
           const response = responses[index] || ""
           const inputId = `human-review-response-${index}`
 
           return (
             <section key={index} className="space-y-3">
-              <p className="whitespace-pre-wrap text-sm text-muted-foreground">
-                {prompt}
-              </p>
+              {/* The message above lists the prompts; numbers pair each with its answer. */}
+              {reviews.length > 1 && (
+                <p className="text-sm font-medium">Request {index + 1}</p>
+              )}
 
               {choices.length > 0 && (
                 <div className="flex flex-wrap gap-2">

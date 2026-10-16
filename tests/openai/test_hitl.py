@@ -55,10 +55,26 @@ def test_pending_ledger_round_trips_exact_function_call_batch() -> None:
     assert restored.function_calls == tuple(calls)
 
 
-def test_completed_ledger_decodes_without_a_continuation() -> None:
+def test_completed_ledger_replays_its_answered_batch() -> None:
     codec = HitlLedgerCodec(TOOL_NAME)
+    calls = [function_call("one"), function_call("two")]
+    pending = pending_metadata(codec, calls)
+    continuation = codec.decode(pending)
+    assert continuation is not None
 
-    assert codec.decode(codec.completed_metadata()) is None
+    completed = codec.completed_metadata(continuation, ["approve", "reject"])
+
+    assert codec.decode(completed) is None
+    # Like a stateless transcript: the calls, then their outputs.
+    assert codec.answered_input(completed) == [
+        *(call.model_dump(mode="json", exclude_none=True) for call in calls),
+        *function_call_outputs(continuation, ["approve", "reject"]),
+    ]
+    assert codec.answered_input(pending) == []
+    # Ledgers completed before answers were kept still decode.
+    assert codec.answered_input({"schema_version": 2, "status": "completed"}) == []
+    with pytest.raises(InvalidHitlLedgerError):
+        codec.completed_metadata(continuation, ["approve"])
 
 
 @pytest.mark.parametrize(

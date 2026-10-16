@@ -52,6 +52,7 @@ def workflow(
     continue_response: AsyncMock | None = None,
     publish_final: AsyncMock | None = None,
     validate_outputs=None,
+    receipt=None,
 ) -> tuple[hitl.HitlWorkflow, AsyncMock, AsyncMock]:
     continue_response = continue_response or AsyncMock()
     publish_final = publish_final or AsyncMock()
@@ -64,6 +65,7 @@ def workflow(
         publish_final=publish_final,
         review=lambda calls: {"reviews": [{"call_id": call.call_id} for call in calls]},
         validate_outputs=validate_outputs,
+        receipt=receipt,
     )
     return instance, continue_response, publish_final
 
@@ -189,6 +191,84 @@ async def test_submit_completes_one_continuation_and_removes_the_control(
     publish_final.assert_awaited_once_with(final)
 
 
+async def test_answered_review_keeps_its_request_and_records_the_decision(
+    chainlit_context,
+) -> None:
+    continue_response = AsyncMock(return_value=response("resp_final"))
+    instance, _, _ = workflow(
+        continue_response=continue_response,
+        receipt=lambda outputs: f"Answered: {', '.join(outputs)}",
+    )
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
+    pending.message.elements[0].remove = AsyncMock()  # type: ignore[method-assign]
+
+    await instance.submit(
+        step_id=review_control["step_id"],
+        element_id=review_control["element_id"],
+        revision=review_control["revision"],
+        outputs=["approve"],
+    )
+
+    assert pending.message.content == "Review 1 request(s).\n\nAnswered: approve"
+    assert pending.message.elements == []
+
+
+async def test_later_requests_replay_answered_reviews_in_place(
+    chainlit_context,
+) -> None:
+    during_continuation: list[list[dict[str, object]]] = []
+
+    async def continue_response(input_items, **_):
+        during_continuation.append(instance.response_input(answers=input_items))
+        return response("resp_final")
+
+    instance, _, _ = workflow(continue_response=continue_response)
+    await cl.Message(content="Refund ORDER-123", type="user_message").send()
+    pending = await instance.publish(
+        response("resp_one", function_call("one")),
+        model_id="review-model",
+    )
+    assert pending is not None
+    review_control = control(pending)
+    pending.message.elements[0].remove = AsyncMock()  # type: ignore[method-assign]
+    # A pending review has no answer to replay yet.
+    assert instance.response_input() == [
+        {"role": "user", "content": "Refund ORDER-123"}
+    ]
+
+    await instance.submit(
+        step_id=review_control["step_id"],
+        element_id=review_control["element_id"],
+        revision=review_control["revision"],
+        outputs=["approve"],
+    )
+    await cl.Message(content="Refund approved.").send()
+
+    # Like a stateless Responses transcript, the review replays as its function
+    # call and output where it happened, and its UI text does not.
+    call = function_call("one").model_dump(mode="json", exclude_none=True)
+    answer = {
+        "type": "function_call_output",
+        "call_id": "call_one",
+        "output": "approve",
+    }
+    assert instance.response_input() == [
+        {"role": "user", "content": "Refund ORDER-123"},
+        call,
+        answer,
+        {"role": "assistant", "content": "Refund approved.", "phase": "final_answer"},
+    ]
+    # While its continuation runs, the review replays with the submitted answers.
+    assert during_continuation == [
+        [{"role": "user", "content": "Refund ORDER-123"}, call, answer]
+    ]
+
+
 async def test_client_function_calls_after_review_go_to_publish_final(
     chainlit_context,
 ) -> None:
@@ -218,7 +298,7 @@ async def test_client_function_calls_after_review_go_to_publish_final(
     publish_final.assert_awaited_once_with(after_review)
 
 
-async def test_chained_interrupt_updates_the_same_element_one_action_at_a_time(
+async def test_chained_interrupt_asks_in_a_new_message_one_action_at_a_time(
     chainlit_context,
 ) -> None:
     second = response("resp_two", function_call("two"))
@@ -231,19 +311,25 @@ async def test_chained_interrupt_updates_the_same_element_one_action_at_a_time(
     )
     assert first is not None
     first_control = control(first)
-    element_id = first_control["element_id"]
+    first_element = first.message.elements[0]
+    first_element.remove = AsyncMock()  # type: ignore[method-assign]
 
     next_pending = await instance.submit(
         step_id=first_control["step_id"],
-        element_id=element_id,
+        element_id=first_control["element_id"],
         revision=first_control["revision"],
         outputs=["approve"],
     )
 
     assert next_pending is not None
     assert continue_response.await_count == 1
-    assert next_pending.message is first.message
-    assert next_pending.message.elements[0].id == element_id
+    # Like a chat transcript, the answered review stays above the new one.
+    assert cl.chat_context.get() == [first.message, next_pending.message]
+    assert first.message.metadata[hitl.HITL_LEDGER_METADATA_KEY]["status"] == (
+        "completed"
+    )
+    assert first.message.elements == []
+    first_element.remove.assert_awaited_once_with()
     next_control = control(next_pending)
     assert next_control["revision"] == "resp_two"
     assert next_pending.message.elements[0].props["reviews"] == [
@@ -402,7 +488,7 @@ async def test_concurrent_same_session_duplicates_continue_only_once(
     assert "no longer pending" in str(errors[0])
 
 
-async def test_resumed_thread_reconstructs_its_control_from_persisted_metadata(
+async def test_resumed_thread_continues_from_persisted_metadata(
     chainlit_context,
 ) -> None:
     second = response("resp_two", function_call("two"))
@@ -433,11 +519,11 @@ async def test_resumed_thread_reconstructs_its_control_from_persisted_metadata(
     )
 
     assert next_pending is not None
-    assert next_pending.message is restored_message
-    assert next_pending.element_id == review_control["element_id"]
-    assert next_pending.message.elements[0].id == review_control["element_id"]
+    assert cl.chat_context.get() == [restored_message, next_pending.message]
+    ledger = restored_message.metadata[hitl.HITL_LEDGER_METADATA_KEY]
+    assert ledger["status"] == "completed"
+    assert restored_message.created_at == "2026-09-18T13:48:54.000000Z"
     assert control(next_pending)["revision"] == "resp_two"
-    assert next_pending.message.created_at == "2026-09-18T13:48:54.000000Z"
     publish_final.assert_not_awaited()
 
     next_control = control(next_pending)

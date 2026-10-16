@@ -312,10 +312,13 @@ Chainlit message with a custom element. It then returns, so the pending review i
 ordinary persisted UI rather than a socket-bound ask coroutine.
 
 Configure one workflow with the application-owned tool and action names, a
-request callback, and a presentation. The bundled `HumanReview` element shows
-every pending call in one form; `HumanReviewForm` builds its props, prompt,
-and answer validation from a function that reads one call's payload. Serve the
-element with `serve_public_files()`:
+request callback, and a presentation. The message shows each pending call's
+prompt, and the bundled `HumanReview` element below it collects every answer in
+one form, numbering several calls to match the message's list. Once answered,
+the form goes away and the message stays in the thread; a `receipt` adds a
+record of the decision to it, such as `Answered: approve`. `HumanReviewForm`
+builds its props, prompt, receipt, and answer validation from a function that
+reads one call's payload. Serve the element with `serve_public_files()`:
 
 ```python
 import json
@@ -350,6 +353,7 @@ hitl = HitlWorkflow(
     element_name=HUMAN_REVIEW_ELEMENT_NAME,
     prompt=form.prompt,
     publish_final=publish_final,
+    receipt=form.receipt,
     review=form.props,
     validate_outputs=form.validate_outputs,
 )
@@ -373,9 +377,9 @@ Call `await hitl.publish(response, model_id=model_id)` when the tool appears and
 custom element submits its opaque step, element, and revision references through
 Chainlit's `callAction`; model IDs, response IDs, function calls, and the
 expected element ID are always read from trusted current-thread message
-metadata. Each accepted action advances one Responses transition. A later
-interrupt updates the same persisted form. Any other response marks the ledger
-complete, removes the form, and goes to `publish_final`, which renders the
+metadata. Each accepted action advances one Responses transition and marks
+the answered ledger complete. A later interrupt asks in a new message, like a
+chat transcript; any other response goes to `publish_final`, which renders the
 answer or runs the client function calls it contains.
 
 Chainlit natively restores the message and custom element when a persisted
@@ -391,6 +395,14 @@ compatibility fix, the UI can finish while the durable ledger remains pending.
 
 OpenAI continuations by ID require a stored prior Response. Stateless client-tool
 loops instead use `continuation_input` to replay every output item in order.
+
+Build later requests with `hitl.response_input()` instead of
+`response_input(text_only_chat_messages())`. Like any stateless Responses
+transcript, it replays each answered review as its function calls and outputs
+where it happened, so the model sees what was asked and answered; the review
+message's own text stays out. While a continuation runs, pass the function
+outputs it submits as `answers`, so a transcript built for client tools then
+includes that review too.
 
 The ledger is strict and versioned. It rejects unknown fields, unexpected tool
 names, duplicate call IDs, and incomplete output batches instead of guessing at
