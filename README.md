@@ -306,8 +306,8 @@ characters.
 
 ## Human-in-the-loop Responses
 
-`chainlit_utils.openai.hitl` validates and serializes exact Responses function-call
-batches. `HitlWorkflow` persists the continuation in a model-context-excluded
+`HitlWorkflow` persists each review's `HitlLedger`, the paused Response's exact
+function calls and, once answered, their outputs, in a model-context-excluded
 Chainlit message with a custom element. It then returns, so the pending review is
 ordinary persisted UI rather than a socket-bound ask coroutine.
 
@@ -377,10 +377,10 @@ Call `await hitl.publish(response, model_id=model_id)` when the tool appears and
 custom element submits its opaque step, element, and revision references through
 Chainlit's `callAction`; model IDs, response IDs, function calls, and the
 expected element ID are always read from trusted current-thread message
-metadata. Each accepted action advances one Responses transition and marks
-the answered ledger complete. A later interrupt asks in a new message, like a
-chat transcript; any other response goes to `publish_final`, which renders the
-answer or runs the client function calls it contains.
+metadata. Each accepted action advances one Responses transition and records
+the answers in the review's ledger. A later interrupt asks in a new message,
+like a chat transcript; any other response goes to `publish_final`, which renders
+the answer or runs the client function calls it contains.
 
 Chainlit natively restores the message and custom element when a persisted
 thread is opened. No `on_chat_end` cancellation, `on_chat_resume` recreation,
@@ -393,8 +393,9 @@ updating it. Chainlit 2.12's official PostgreSQL layer hydrates `createdAt`
 without the trailing `Z` that its own update path requires; without this narrow
 compatibility fix, the UI can finish while the durable ledger remains pending.
 
-OpenAI continuations by ID require a stored prior Response. Stateless client-tool
-loops instead use `continuation_input` to replay every output item in order.
+OpenAI documents `previous_response_id` for stored responses and manual replay
+for `store: false`. Stateless client-tool loops use `continuation_input` to
+replay every output item in order.
 
 Build later requests with `hitl.response_input()` instead of
 `response_input(text_only_chat_messages())`. Like any stateless Responses
@@ -404,9 +405,10 @@ message's own text stays out. While a continuation runs, pass the function
 outputs it submits as `answers`, so a transcript built for client tools then
 includes that review too.
 
-The ledger is strict and versioned. It rejects unknown fields, unexpected tool
-names, duplicate call IDs, and incomplete output batches instead of guessing at
-state that may no longer be safe to resume.
+The ledger is strict and versioned. It rejects unknown fields, other schema
+versions, duplicate call IDs, and outputs that do not answer every call instead
+of guessing at state that may no longer be safe to resume. A review cannot
+include other function calls.
 
 ## MCP tools
 

@@ -8,7 +8,7 @@ import {
 } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
-import { useEffect, useState } from "react"
+import { useState } from "react"
 
 export default function HumanReview() {
   const reviews = Array.isArray(props.reviews) ? props.reviews : []
@@ -16,12 +16,6 @@ export default function HumanReview() {
   const [responses, setResponses] = useState(() => reviews.map(() => ""))
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState("")
-
-  useEffect(() => {
-    setResponses(reviews.map(() => ""))
-    setSubmitting(false)
-    setError("")
-  }, [control.revision])
 
   const setResponse = (index, value) => {
     setResponses((current) =>
