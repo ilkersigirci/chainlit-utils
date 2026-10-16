@@ -1,11 +1,14 @@
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import chainlit as cl
+import chainlit.socket as socket
 import pytest
-from chainlit.context import init_http_context
+from chainlit.context import ChainlitContext, init_http_context, init_ws_context
+from chainlit.session import WebsocketSession
 from chainlit.user_session import user_sessions
 from openai.types.responses import Response, ResponseFunctionToolCall
 from openai.types.responses.response_function_tool_call import CallerProgram
@@ -28,6 +31,33 @@ async def chainlit_context():
     finally:
         cl.chat_context.clear()
         user_sessions.pop(context.session.id, None)
+
+
+@pytest.fixture
+async def browser_context() -> AsyncIterator[ChainlitContext]:
+    """A browser session's context, as Chainlit's action route sets it."""
+    session = WebsocketSession(
+        id="session",
+        socket_id="socket",
+        emit=AsyncMock(),
+        emit_call=AsyncMock(),
+        user_env={},
+        client_type="webapp",
+        thread_id="thread",
+    )
+    context = init_ws_context(session)
+    cl.chat_context.clear()
+    try:
+        yield context
+    finally:
+        cl.chat_context.clear()
+        user_sessions.pop(session.id, None)
+        await session.delete()
+
+
+def ui_events(context: ChainlitContext) -> list[str]:
+    """Return the events Chainlit sent to the browser, in order."""
+    return [call.args[0] for call in context.session.emit.await_args_list]
 
 
 @pytest.fixture
@@ -97,17 +127,20 @@ def stored_ledger(message: cl.Message) -> hitl.HitlLedger:
     )
 
 
+def review_action(pending: hitl.PendingHitl, *outputs: str) -> cl.Action:
+    """Build the action the review element submits with these answers."""
+    review_control = control(pending)
+    payload = {
+        key: review_control[key] for key in ("step_id", "element_id", "revision")
+    }
+    return cl.Action(name=ACTION_NAME, payload={**payload, "outputs": list(outputs)})
+
+
 async def answer(
     instance: hitl.HitlWorkflow, pending: hitl.PendingHitl, *outputs: str
 ) -> hitl.PendingHitl | None:
-    """Submit answers the way the review element does."""
-    review_control = control(pending)
-    return await instance.submit(
-        step_id=review_control["step_id"],
-        element_id=review_control["element_id"],
-        revision=review_control["revision"],
-        outputs=list(outputs),
-    )
+    """Submit answers and await their continuation."""
+    return await instance.submit(**review_action(pending, *outputs).payload)
 
 
 async def test_publish_persists_a_review_message_with_its_ledger_and_control(
@@ -231,8 +264,8 @@ async def test_later_requests_replay_answered_reviews_in_place(
 ) -> None:
     during_continuation: list[list[dict[str, object]]] = []
 
-    async def continue_response(input_items, **_):
-        during_continuation.append(instance.response_input(answers=input_items))
+    async def continue_response(*_args, **_kwargs) -> Response:
+        during_continuation.append(instance.response_input())
         return response("resp_final")
 
     instance, _, _ = workflow(continue_response=continue_response)
@@ -263,7 +296,8 @@ async def test_later_requests_replay_answered_reviews_in_place(
         output,
         {"role": "assistant", "content": "Refund approved.", "phase": "final_answer"},
     ]
-    # While its continuation runs, the review replays with the submitted answers.
+    # The answers are recorded before the continuation runs, so it replays the
+    # review too.
     assert during_continuation == [
         [{"role": "user", "content": "Refund ORDER-123"}, call, output]
     ]
@@ -320,8 +354,81 @@ async def test_a_later_pause_asks_in_a_new_message(
     publish_final.assert_awaited_once_with(final)
 
 
-async def test_failed_continuation_keeps_the_review_pending(
+async def test_submit_action_answers_at_once_and_continues_as_the_session_task(
+    browser_context: ChainlitContext,
+    removed_controls: list[str],
+) -> None:
+    release = asyncio.Event()
+
+    async def continue_response(*_args, **_kwargs) -> Response:
+        await release.wait()
+        return response("resp_final")
+
+    instance, _, publish_final = workflow(continue_response=continue_response)
+    pending = await instance.publish(
+        response("resp_one", function_call("one")), model_id="review-model"
+    )
+    assert pending is not None
+    action = review_action(pending, "approve")
+
+    reply = await instance.submit_action(action)
+    task = browser_context.session.current_task
+    await asyncio.sleep(0)
+
+    # The form gets its reply and becomes a record while the graph still runs;
+    # like a chat message, the run is the session's task.
+    assert reply == {"ok": True}
+    assert stored_ledger(pending.message).outputs == ("approve",)
+    assert removed_controls == [pending.ledger.element_id]
+    assert task is not None and not task.done()
+    assert ui_events(browser_context)[-1] == "task_start"
+    # A second click is answered at once instead of waiting for the run.
+    assert await instance.submit_action(action) == {
+        "ok": False,
+        "error": "This human-review request is no longer pending.",
+    }
+
+    release.set()
+    await task
+
+    publish_final.assert_awaited_once_with(response("resp_final"))
+    assert ui_events(browser_context)[-1] == "task_end"
+
+
+async def test_chainlit_stop_cancels_a_running_continuation(
+    browser_context: ChainlitContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def continue_response(*_args, **_kwargs) -> Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    instance, _, publish_final = workflow(continue_response=continue_response)
+    notice = AsyncMock()
+    monkeypatch.setattr(hitl, "send_ui_message", notice)
+    pending = await instance.publish(
+        response("resp_one", function_call("one")), model_id="review-model"
+    )
+    assert pending is not None
+    await instance.submit_action(review_action(pending, "approve"))
+    task = browser_context.session.current_task
+    assert task is not None
+    await asyncio.sleep(0)
+
+    # The Stop button reaches Chainlit's own handler, which cancels the
+    # session's task. This fails if a Chainlit upgrade stops honoring it.
+    await socket.sio.handlers["/"]["stop"](browser_context.session.socket_id)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert ui_events(browser_context)[-1] == "task_end"
+    notice.assert_not_awaited()
+    publish_final.assert_not_awaited()
+
+
+async def test_a_failed_continuation_leaves_the_review_answered(
     chainlit_context,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     failed = Response.model_construct(
         id="resp_failed",
@@ -332,16 +439,21 @@ async def test_failed_continuation_keeps_the_review_pending(
     instance, _, publish_final = workflow(
         continue_response=AsyncMock(return_value=failed)
     )
+    notice = AsyncMock()
+    monkeypatch.setattr(hitl, "send_ui_message", notice)
     pending = await instance.publish(
         response("resp_one", function_call("one")), model_id="review-model"
     )
     assert pending is not None
 
-    with pytest.raises(RuntimeError, match="Resume failed"):
-        await answer(instance, pending, "approve")
+    assert await instance.submit_action(review_action(pending, "approve")) == {
+        "ok": True
+    }
+    await chainlit_context.session.current_task
 
-    assert stored_ledger(pending.message) == pending.ledger
-    assert pending.ledger.outputs is None
+    # The chat reports the failure; the next message continues the conversation.
+    assert stored_ledger(pending.message).outputs == ("approve",)
+    notice.assert_awaited_once_with("Response failed: Resume failed")
     publish_final.assert_not_awaited()
 
 
@@ -355,9 +467,7 @@ async def test_stale_or_forged_submission_is_rejected_before_continuation(
         response("resp_one", function_call("one")), model_id="review-model"
     )
     assert pending is not None
-    submission = {**control(pending), "outputs": ["approve"]}
-    del submission["action"]
-    submission[field] = "forged"
+    submission = {**review_action(pending, "approve").payload, field: "forged"}
 
     with pytest.raises(hitl.InvalidHitlSubmissionError, match="stale"):
         await instance.submit(**submission)
@@ -380,44 +490,6 @@ async def test_application_validation_runs_against_trusted_calls(
 
     validate.assert_called_once_with(pending.ledger.function_calls, ["forged"])
     continue_response.assert_not_awaited()
-
-
-async def test_concurrent_duplicate_submissions_continue_only_once(
-    chainlit_context,
-) -> None:
-    continuation_started = asyncio.Event()
-    release_continuation = asyncio.Event()
-
-    async def continue_response(*_args, **_kwargs) -> Response:
-        continuation_started.set()
-        await release_continuation.wait()
-        return response("resp_final")
-
-    continue_mock = AsyncMock(side_effect=continue_response)
-    instance, _, _ = workflow(continue_response=continue_mock)
-    pending = await instance.publish(
-        response("resp_one", function_call("one")), model_id="review-model"
-    )
-    assert pending is not None
-    start = asyncio.Event()
-
-    async def submit() -> hitl.PendingHitl | None:
-        await start.wait()
-        return await answer(instance, pending, "approve")
-
-    first = asyncio.create_task(submit())
-    duplicate = asyncio.create_task(submit())
-    start.set()
-    await continuation_started.wait()
-    release_continuation.set()
-    results = await asyncio.gather(first, duplicate, return_exceptions=True)
-
-    assert continue_mock.await_count == 1
-    assert sum(result is None for result in results) == 1
-    errors = [result for result in results if isinstance(result, Exception)]
-    assert len(errors) == 1
-    assert isinstance(errors[0], hitl.InvalidHitlSubmissionError)
-    assert "no longer pending" in str(errors[0])
 
 
 async def test_resumed_thread_continues_from_its_persisted_ledger(
@@ -456,42 +528,6 @@ async def test_resumed_thread_continues_from_its_persisted_ledger(
 
     assert continue_response.await_count == 2
     publish_final.assert_awaited_once_with(final)
-
-
-async def test_a_review_left_pending_by_a_lost_write_replays_nothing(
-    chainlit_context,
-) -> None:
-    transcripts: list[list[dict[str, object]]] = []
-    responses = [response("resp_two", function_call("two")), response("resp_final")]
-
-    async def continue_response(input_items, **_):
-        transcripts.append(instance.response_input(answers=input_items))
-        return responses.pop(0)
-
-    instance, _, _ = workflow(continue_response=continue_response)
-    user = await cl.Message(content="Refund ORDER-123", type="user_message").send()
-    first = await instance.publish(
-        response("resp_one", function_call("one")), model_id="review-model"
-    )
-    assert first is not None
-    unanswered = first.message.to_dict()
-    second = await answer(instance, first, "approve")
-    assert second is not None
-
-    # Chainlit writes in background tasks. After a reload that lost the first
-    # review's completion, both reviews are pending.
-    cl.chat_context.clear()
-    for step in (user.to_dict(), unanswered, second.message.to_dict()):
-        cl.chat_context.add(cl.Message.from_dict(step))
-
-    await answer(instance, second, "reject")
-
-    # The first review's answers are unknown, so only the second one replays.
-    assert transcripts[-1] == [
-        {"role": "user", "content": "Refund ORDER-123"},
-        function_call("two").model_dump(mode="json", exclude_none=True),
-        {"type": "function_call_output", "call_id": "call_two", "output": "reject"},
-    ]
 
 
 async def test_terminal_response_is_published_without_a_review(
@@ -581,65 +617,29 @@ def test_stored_ledger_rejects_corrupt_state(corruption: dict[str, object]) -> N
 
 
 @pytest.mark.parametrize(
-    ("change", "failure", "reply"),
+    ("change", "error"),
     [
-        ({}, None, {"ok": True}),
-        (
-            {"model_id": "browser-controlled"},
-            None,
-            {"ok": False, "error": "Invalid human-review submission."},
-        ),
-        (
-            {"outputs": "approve"},
-            None,
-            {"ok": False, "error": "Invalid human-review submission."},
-        ),
-        (
-            {"revision": "resp_old"},
-            None,
-            {"ok": False, "error": "This human-review request is stale."},
-        ),
-        (
-            {},
-            RuntimeError("gateway down"),
-            {"ok": False, "error": "The human review could not be submitted."},
-        ),
+        ({"model_id": "browser-controlled"}, "Invalid human-review submission."),
+        ({"outputs": "approve"}, "Invalid human-review submission."),
+        ({"revision": "resp_old"}, "This human-review request is stale."),
     ],
-    ids=["accepted", "extra-field", "text-outputs", "stale", "continuation-failed"],
+    ids=["extra-field", "text-outputs", "stale"],
 )
-async def test_submit_action_replies_to_the_review_element(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_submit_action_replies_with_the_error_the_element_shows(
     chainlit_context,
     change: dict[str, object],
-    failure: Exception | None,
-    reply: dict[str, object],
+    error: str,
 ) -> None:
-    instance, _, publish_final = workflow(
-        continue_response=AsyncMock(
-            side_effect=failure, return_value=response("resp_two")
-        )
-    )
-    notice = AsyncMock()
-    monkeypatch.setattr(hitl, "send_ui_message", notice)
+    instance, continue_response, _ = workflow()
     pending = await instance.publish(
         response("resp_one", function_call("one")), model_id="review-model"
     )
     assert pending is not None
-    review_control = control(pending)
-    payload = {
-        "step_id": review_control["step_id"],
-        "element_id": review_control["element_id"],
-        "revision": review_control["revision"],
-        "outputs": ["approve"],
-        **change,
-    }
+    payload = {**review_action(pending, "approve").payload, **change}
 
     result = await instance.submit_action(cl.Action(name=ACTION_NAME, payload=payload))
 
-    assert result == reply
-    if reply["ok"]:
-        publish_final.assert_awaited_once()
-    if failure is not None:
-        notice.assert_awaited_once_with("Response failed: gateway down")
-    else:
-        notice.assert_not_awaited()
+    assert result == {"ok": False, "error": error}
+    assert stored_ledger(pending.message).outputs is None
+    assert chainlit_context.session.current_task is None
+    continue_response.assert_not_awaited()

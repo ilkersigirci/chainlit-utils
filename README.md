@@ -365,26 +365,28 @@ async def submit_review(action: cl.Action):
 ```
 
 The reviewer picks one of a review's `choices` or, when `allow_other` is set or
-there are no choices, writes an answer. `submit_action` returns the element's
-reply: `{"ok": True}`, or `{"ok": False, "error": message}` for an invalid or
-stale submission, which the element shows. A failed continuation is also logged
-and reported in the chat. An application with its own element passes its name
-and callbacks instead; the element reads the `_chainlit_utils_hitl` prop and
-submits its `step_id`, `element_id`, and `revision` with the `outputs`.
+there are no choices, writes an answer. `submit_action` records the answers
+and replies at once: `{"ok": True}`, or `{"ok": False, "error": message}` for an
+invalid or stale submission, which the element shows. The continuation then
+runs as the session's task, like a chat message, so Chainlit shows it running
+and Stop cancels it. A failed continuation is logged and reported in the chat,
+and the review stays answered. An application with its own element passes its
+name and callbacks instead; the element reads the `_chainlit_utils_hitl` prop
+and submits its `step_id`, `element_id`, and `revision` with the `outputs`.
 
 Call `await hitl.publish(response, model_id=model_id)` when the tool appears and
 `await hitl.block_new_message(message)` before starting a new request. The
 custom element submits its opaque step, element, and revision references through
 Chainlit's `callAction`; model IDs, response IDs, function calls, and the
 expected element ID are always read from trusted current-thread message
-metadata. Each accepted action advances one Responses transition and records
-the answers in the review's ledger. A later interrupt asks in a new message,
+metadata. Each accepted action records the answers in the review's ledger,
+then advances one Responses transition. A later interrupt asks in a new message,
 like a chat transcript; any other response goes to `publish_final`, which renders
 the answer or runs the client function calls it contains.
 
 Chainlit natively restores the message and custom element when a persisted
 thread is opened. No `on_chat_end` cancellation, `on_chat_resume` recreation,
-session task ownership, reconnect timer, or `user_session` HITL cache is needed.
+reconnect timer, or `user_session` HITL cache is needed.
 The application callbacks still own the API request, final rendering, payload
 schema, and client credentials.
 
@@ -401,9 +403,9 @@ Build later requests with `hitl.response_input()` instead of
 `response_input(text_only_chat_messages())`. Like any stateless Responses
 transcript, it replays each answered review as its function calls and outputs
 where it happened, so the model sees what was asked and answered; the review
-message's own text stays out. While a continuation runs, pass the function
-outputs it submits as `answers`, so a transcript built for client tools then
-includes that review too.
+message's own text stays out. A review records its answers before its
+continuation runs, so a transcript built meanwhile, such as for client tools,
+includes it.
 
 The ledger is strict and versioned. It rejects unknown ledger fields, other
 schema versions, duplicate call IDs, and outputs that do not answer every call
