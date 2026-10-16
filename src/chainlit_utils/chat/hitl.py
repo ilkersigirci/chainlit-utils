@@ -1,37 +1,86 @@
 """Event-driven OpenAI Responses HITL workflows for Chainlit."""
 
 import asyncio
-import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+import uuid
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, Self
 
 import chainlit as cl
 from openai.types.responses import Response, ResponseFunctionToolCall
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from chainlit_utils.chat.history import mark_model_context_excluded, send_ui_message
-from chainlit_utils.openai.hitl import (
-    HitlContinuation,
-    HitlLedgerCodec,
-    InvalidHitlLedgerError,
-    function_call_outputs,
+from chainlit_utils.chat.history import (
+    is_model_context,
+    mark_model_context_excluded,
+    send_ui_message,
 )
-from chainlit_utils.openai.responses import raise_for_response
-from chainlit_utils.openai.tools import function_calls
+from chainlit_utils.openai.responses import raise_for_response, response_input
+from chainlit_utils.openai.tools import function_call_output, function_calls
 
 logger = logging.getLogger(__name__)
 
 HITL_LEDGER_METADATA_KEY = "chainlit_utils.hitl_ledger"
-HITL_ELEMENT_METADATA_KEY = "chainlit_utils.hitl_element_id"
 HITL_CONTROL_PROP = "_chainlit_utils_hitl"
 
 
 class InvalidHitlSubmissionError(ValueError):
     """A browser submission does not match the current durable HITL state."""
+
+
+class HitlLedger(BaseModel):
+    """One review's paused function calls and, once answered, their outputs.
+
+    The review message persists it, so a reload resumes the paused Response
+    and later requests replay the answered review. A cancelled review never
+    resumes and replays nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[3] = 3
+    model_id: str = Field(min_length=1)
+    response_id: str = Field(min_length=1)
+    element_id: str = Field(min_length=1)
+    function_calls: tuple[ResponseFunctionToolCall, ...] = Field(min_length=1)
+    # None until the review is answered.
+    outputs: tuple[str, ...] | None = None
+    cancelled: bool = False
+
+    @model_validator(mode="after")
+    def _complete_batch(self) -> Self:
+        if len({call.call_id for call in self.function_calls}) != len(
+            self.function_calls
+        ):
+            raise ValueError("HITL call IDs must be unique.")
+        if self.outputs is not None:
+            if self.cancelled:
+                raise ValueError("A cancelled HITL review has no outputs.")
+            self.output_items(self.outputs)
+        return self
+
+    @property
+    def closed(self) -> bool:
+        """Whether the review was answered or cancelled."""
+        return self.outputs is not None or self.cancelled
+
+    def call_items(self) -> list[dict[str, Any]]:
+        """Return the function calls as Responses input items."""
+        return [
+            call.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for call in self.function_calls
+        ]
+
+    def output_items(self, outputs: Sequence[str]) -> list[dict[str, Any]]:
+        """Return the function outputs that answer every call, in call order."""
+        if len(outputs) != len(self.function_calls):
+            raise ValueError("Every HITL function call requires one output.")
+        return [
+            function_call_output(call, output)
+            for call, output in zip(self.function_calls, outputs, strict=True)
+        ]
 
 
 class _Submission(BaseModel):
@@ -42,44 +91,23 @@ class _Submission(BaseModel):
     step_id: str = Field(min_length=1)
     element_id: str = Field(min_length=1)
     revision: str = Field(min_length=1)
-    outputs: list[str] = Field(min_length=1)
+    # An answer for every call, or ``cancel`` to close the review without one.
+    outputs: Annotated[list[str], Field(min_length=1)] | None = None
+    cancel: bool = False
+
+    @model_validator(mode="after")
+    def _answer_or_cancel(self) -> Self:
+        if self.cancel == (self.outputs is not None):
+            raise ValueError("A submission answers or cancels the review.")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
 class PendingHitl:
-    """A durable Responses continuation paired with its Chainlit message."""
+    """A review awaiting answers: its Chainlit message and durable ledger."""
 
     message: cl.Message
-    continuation: HitlContinuation
-    element_id: str
-
-
-@dataclass(slots=True)
-class _LockEntry:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    users: int = 0
-
-
-class _SubmissionLocks:
-    """Serialize submissions for one ledger step without retaining idle locks."""
-
-    def __init__(self) -> None:
-        self._guard = asyncio.Lock()
-        self._entries: dict[str, _LockEntry] = {}
-
-    @asynccontextmanager
-    async def hold(self, step_id: str) -> AsyncIterator[None]:
-        async with self._guard:
-            entry = self._entries.setdefault(step_id, _LockEntry())
-            entry.users += 1
-        try:
-            async with entry.lock:
-                yield
-        finally:
-            async with self._guard:
-                entry.users -= 1
-                if entry.users == 0:
-                    self._entries.pop(step_id, None)
+    ledger: HitlLedger
 
 
 class _ContinueResponse(Protocol):
@@ -102,6 +130,7 @@ _ValidateOutputs = Callable[
     [Sequence[ResponseFunctionToolCall], Sequence[str]],
     Sequence[str],
 ]
+_Receipt = Callable[[Sequence[str]], str]
 
 
 class HitlWorkflow:
@@ -118,12 +147,9 @@ class HitlWorkflow:
         publish_final: _PublishFinal,
         review: _ReviewProps,
         validate_outputs: _ValidateOutputs | None = None,
+        receipt: _Receipt | None = None,
     ) -> None:
-        if not action_name:
-            raise ValueError("HITL action name must be a non-empty string.")
-        if not element_name:
-            raise ValueError("HITL element name must be a non-empty string.")
-        self._codec = HitlLedgerCodec(tool_name)
+        self._tool_name = tool_name
         self._action_name = action_name
         self._continue_response = continue_response
         self._element_name = element_name
@@ -131,12 +157,40 @@ class HitlWorkflow:
         self._publish_final = publish_final
         self._review = review
         self._validate_outputs = validate_outputs
-        self._submission_locks = _SubmissionLocks()
+        self._receipt = receipt
 
     async def publish(self, response: Response, *, model_id: str) -> PendingHitl | None:
-        """Publish a terminal response or persist its interrupt controls and return."""
+        """Publish a terminal response or ask for review in a new message."""
         raise_for_response(response)
-        return await self._transition(response, model_id=model_id)
+        calls = function_calls(response)
+        # Only this workflow's tool pauses for review. Any other response,
+        # including client function calls, belongs to publish_final.
+        if any(call.name == self._tool_name for call in calls):
+            return await self._send_review(response, calls, model_id=model_id)
+        await self._publish_final(response)
+        return None
+
+    def response_input(self) -> list[dict[str, Any]]:
+        """Return the chat as Responses input that replays answered reviews.
+
+        Like a stateless Responses transcript, each answered review replays its
+        function calls and outputs in place; other messages follow
+        ``text_only_chat_messages``. A review records its answers before its
+        continuation runs, so a transcript built meanwhile includes it.
+        """
+        items: list[dict[str, Any]] = []
+        for message, openai_message in zip(
+            cl.chat_context.get(),
+            cl.chat_context.to_openai(),
+            strict=True,
+        ):
+            ledger = _ledger(message)
+            if ledger is None:
+                if is_model_context(message):
+                    items += response_input([openai_message])
+            elif ledger.outputs is not None:
+                items += ledger.call_items() + ledger.output_items(ledger.outputs)
+        return items
 
     async def block_new_message(self, trigger_message: cl.Message) -> bool:
         """Reject a new user turn while the current thread awaits human input."""
@@ -145,30 +199,43 @@ class HitlWorkflow:
         mark_model_context_excluded(trigger_message)
         await trigger_message.update()
         await send_ui_message(
-            "Resolve the pending interrupt before starting another request."
+            "Answer or cancel the pending review before starting another request."
         )
         return True
 
     async def submit_action(self, action: cl.Action) -> dict[str, object]:
-        """Handle a review element's action and return its ``callAction`` reply.
+        """Record a review element's answers and return its ``callAction`` reply.
 
         Register this for the workflow's action name. The reply is
-        ``{"ok": True}`` or ``{"ok": False, "error": message}``; the element
-        shows the message. A failed continuation is also logged and reported in
-        the chat.
+        ``{"ok": True}`` once the answers are recorded, or ``{"ok": False,
+        "error": message}``, which the element shows. The continuation then runs
+        as the session's task, like a chat message: Chainlit shows it running
+        and Stop cancels it. A failed continuation is logged and reported in the
+        chat. A cancelled review closes without a continuation.
         """
         try:
             submission = _Submission.model_validate(action.payload)
         except ValidationError:
             return {"ok": False, "error": "Invalid human-review submission."}
         try:
-            await self.submit(**submission.model_dump())
+            pending = self._pending(
+                step_id=submission.step_id,
+                element_id=submission.element_id,
+                revision=submission.revision,
+            )
+            if submission.outputs is None:
+                # Like a cancelled Open WebUI card, the paused Response is left
+                # to the server's expiry.
+                cancelled = pending.ledger.model_copy(update={"cancelled": True})
+                await self._close(pending, cancelled, "Cancelled.")
+                return {"ok": True}
+            input_items = await self._record(pending, submission.outputs)
         except InvalidHitlSubmissionError as exc:
             return {"ok": False, "error": str(exc)}
-        except Exception as exc:
-            logger.exception("Chainlit HITL continuation failed")
-            await send_ui_message(f"Response failed: {exc}")
-            return {"ok": False, "error": "The human review could not be submitted."}
+        # Chainlit runs a chat message the same way; Stop cancels this task.
+        cl.context.session.current_task = asyncio.create_task(
+            self._run(pending.ledger, input_items)
+        )
         return {"ok": True}
 
     async def submit(
@@ -179,218 +246,151 @@ class HitlWorkflow:
         revision: str,
         outputs: Sequence[str],
     ) -> PendingHitl | None:
-        """Validate a UI action and advance one durable continuation."""
-        if not all(
-            isinstance(value, str) and value
-            for value in (step_id, element_id, revision)
-        ):
-            raise InvalidHitlSubmissionError("The human-review reference is invalid.")
-        if isinstance(outputs, (str, bytes)) or not isinstance(outputs, Sequence):
-            raise InvalidHitlSubmissionError(
-                "Human-review outputs must be a list of strings."
-            )
-
-        async with self._submission_locks.hold(step_id):
-            pending = self._current_pending()
-            if pending is None:
-                raise InvalidHitlSubmissionError(
-                    "This human-review request is no longer pending."
-                )
-            if pending.message.id != step_id:
-                raise InvalidHitlSubmissionError("This human-review request is stale.")
-            if pending.continuation.response_id != revision:
-                raise InvalidHitlSubmissionError("This human-review revision is stale.")
-            if pending.element_id != element_id:
-                raise InvalidHitlSubmissionError(
-                    "This human-review control is invalid or stale."
-                )
-
-            element = self._control_element(pending)
-            validated_outputs = self._validated_outputs(
-                pending.continuation.function_calls,
-                outputs,
-            )
-            try:
-                input_items = function_call_outputs(
-                    pending.continuation,
-                    validated_outputs,
-                )
-            except (TypeError, ValueError) as exc:
-                raise InvalidHitlSubmissionError(str(exc)) from exc
-
-            response = await self._continue_response(
-                input_items,
-                model_id=pending.continuation.model_id,
-                previous_response_id=pending.continuation.response_id,
-            )
-            # A failed model response must leave the prior durable request intact.
-            raise_for_response(response)
-            return await self._transition(
-                response,
-                model_id=pending.continuation.model_id,
-                ledger_message=pending.message,
-                element=element,
-            )
+        """Record a UI action's answers, then continue the paused Response."""
+        pending = self._pending(
+            step_id=step_id, element_id=element_id, revision=revision
+        )
+        input_items = await self._record(pending, outputs)
+        return await self._continue(pending.ledger, input_items)
 
     def _current_pending(self) -> PendingHitl | None:
         for message in reversed(cl.chat_context.get()):
-            metadata = message.metadata
-            if not isinstance(metadata, Mapping):
-                continue
-            if HITL_LEDGER_METADATA_KEY not in metadata:
-                continue
-            continuation = self._codec.decode(metadata[HITL_LEDGER_METADATA_KEY])
-            if continuation is None:
-                return None
-            if not isinstance(message, cl.Message):
-                raise InvalidHitlLedgerError(
-                    "The pending HITL step is not a Chainlit message."
-                )
-            element_id = metadata.get(HITL_ELEMENT_METADATA_KEY)
-            if not isinstance(element_id, str) or not element_id:
-                raise InvalidHitlLedgerError(
-                    "The pending HITL element reference is invalid."
-                )
-            return PendingHitl(
-                message=message,
-                continuation=continuation,
-                element_id=element_id,
-            )
+            ledger = _ledger(message)
+            if ledger is not None:
+                return None if ledger.closed else PendingHitl(message, ledger)
         return None
 
-    def _validated_outputs(
-        self,
-        calls: Sequence[ResponseFunctionToolCall],
-        outputs: Sequence[str],
-    ) -> tuple[str, ...]:
+    def _pending(self, *, step_id: str, element_id: str, revision: str) -> PendingHitl:
+        # Callers close the review before their first await, so a duplicate
+        # submission finds it closed.
+        pending = self._current_pending()
+        if pending is None:
+            raise InvalidHitlSubmissionError(
+                "This human-review request is no longer pending."
+            )
+        ledger = pending.ledger
+        if (pending.message.id, ledger.element_id, ledger.response_id) != (
+            step_id,
+            element_id,
+            revision,
+        ):
+            raise InvalidHitlSubmissionError("This human-review request is stale.")
+        return pending
+
+    async def _record(
+        self, pending: PendingHitl, outputs: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        ledger = pending.ledger
         try:
-            validated = (
-                self._validate_outputs(calls, outputs)
+            answers = tuple(
+                self._validate_outputs(ledger.function_calls, outputs)
                 if self._validate_outputs is not None
                 else outputs
             )
-            if isinstance(validated, (str, bytes)) or not isinstance(
-                validated, Sequence
-            ):
-                raise TypeError("Human-review outputs must be a list of strings.")
-            if any(not isinstance(output, str) for output in validated):
-                raise TypeError("Human-review outputs must be strings.")
-            return tuple(validated)
+            input_items = ledger.output_items(answers)
         except (TypeError, ValueError) as exc:
             raise InvalidHitlSubmissionError(str(exc)) from exc
+        await self._close(
+            pending,
+            ledger.model_copy(update={"outputs": answers}),
+            self._receipt(answers) if self._receipt is not None else None,
+        )
+        return input_items
 
-    async def _transition(
+    async def _close(
+        self, pending: PendingHitl, ledger: HitlLedger, record: str | None
+    ) -> None:
+        message = pending.message
+        message.elements = []
+        if record is not None:
+            # The closed review keeps its request and records the outcome.
+            message.content = f"{message.content}\n\n{record}"
+        _set_ledger(message, ledger)
+        _normalize_chainlit_created_at(message)
+        await message.update()
+        # A restored thread's message has no elements, so the control is
+        # rebuilt from the ledger; removal needs only its ID.
+        control = cl.CustomElement(id=ledger.element_id, name=self._element_name)
+        try:
+            await control.remove()
+        except Exception:
+            logger.exception("Failed to remove a closed HITL element")
+
+    async def _continue(
+        self, ledger: HitlLedger, input_items: list[dict[str, Any]]
+    ) -> PendingHitl | None:
+        response = await self._continue_response(
+            input_items,
+            model_id=ledger.model_id,
+            previous_response_id=ledger.response_id,
+        )
+        return await self.publish(response, model_id=ledger.model_id)
+
+    async def _run(self, ledger: HitlLedger, input_items: list[dict[str, Any]]) -> None:
+        emitter = cl.context.emitter
+        await emitter.task_start()
+        try:
+            await self._continue(ledger, input_items)
+        except Exception as exc:
+            logger.exception("Chainlit HITL continuation failed")
+            await send_ui_message(f"Response failed: {exc}")
+        finally:
+            await emitter.task_end()
+
+    async def _send_review(
         self,
         response: Response,
+        calls: Sequence[ResponseFunctionToolCall],
         *,
         model_id: str,
-        ledger_message: cl.Message | None = None,
-        element: cl.CustomElement | None = None,
-    ) -> PendingHitl | None:
-        calls = function_calls(response)
-        # Only this workflow's tool pauses for review. Any other response,
-        # including client function calls, belongs to publish_final.
-        if any(call.name == self._codec.tool_name for call in calls):
-            continuation = self._codec.continuation(
-                model_id=model_id,
-                response_id=response.id,
-                function_calls=calls,
-            )
-            prompt = self._prompt(calls)
-            message = ledger_message or cl.Message(content=prompt)
-            control = element or cl.CustomElement(
-                name=self._element_name,
-                display="inline",
-                props={},
-            )
-            props = dict(self._review(calls))
-            props[HITL_CONTROL_PROP] = {
-                "action": self._action_name,
-                "element_id": control.id,
-                "revision": continuation.response_id,
-                "step_id": message.id,
-            }
-            content = json.dumps(props, ensure_ascii=False)
-            control.props = props
-            # Chainlit serializes CustomElement props only during construction.
-            # Refresh content when an existing persisted element is reused.
-            control.content = content
-            message.content = prompt
-            message.elements = cast("list[Any]", [control])
-            _set_ledger_metadata(
-                message,
-                self._codec.pending_metadata(continuation),
-                metadata_key=HITL_LEDGER_METADATA_KEY,
-            )
-            message.metadata = {
-                **(message.metadata or {}),
-                HITL_ELEMENT_METADATA_KEY: control.id,
-            }
-            _normalize_chainlit_created_at(message)
-            if ledger_message is None:
-                await message.send()
-            else:
-                await message.update()
-            return PendingHitl(
-                message=message,
-                continuation=continuation,
-                element_id=control.id,
-            )
-
-        if ledger_message is not None:
-            ledger_message.elements = []
-            _set_ledger_metadata(
-                ledger_message,
-                self._codec.completed_metadata(),
-                metadata_key=HITL_LEDGER_METADATA_KEY,
-            )
-            ledger_message.metadata = {
-                key: value
-                for key, value in (ledger_message.metadata or {}).items()
-                if key != HITL_ELEMENT_METADATA_KEY
-            }
-            # Persist completion before rendering final output so a reconnect
-            # cannot replay the already-consumed continuation.
-            _normalize_chainlit_created_at(ledger_message)
-            await ledger_message.update()
-            if element is not None:
-                try:
-                    await element.remove()
-                except Exception:
-                    logger.exception("Failed to remove a completed HITL element")
-        await self._publish_final(response)
-        return None
-
-    def _control_element(self, pending: PendingHitl) -> cl.CustomElement:
-        """Reuse the live control or reconstruct its persisted Chainlit identity."""
-        for element in pending.message.elements:
-            if (
-                isinstance(element, cl.CustomElement)
-                and element.id == pending.element_id
-                and element.name == self._element_name
-                and element.for_id == pending.message.id
-            ):
-                return cast(cl.CustomElement, element)
-        return cl.CustomElement(
-            thread_id=pending.message.thread_id,
-            name=self._element_name,
-            id=pending.element_id,
-            display="inline",
-            for_id=pending.message.id,
-            props={},
+    ) -> PendingHitl:
+        if any(call.name != self._tool_name for call in calls):
+            raise ValueError("A human review cannot include other function calls.")
+        ledger = HitlLedger(
+            model_id=model_id,
+            response_id=response.id,
+            element_id=str(uuid.uuid4()),
+            function_calls=tuple(calls),
         )
+        # The control's props name its message, so both IDs come first.
+        message_id = str(uuid.uuid4())
+        control = {
+            "action": self._action_name,
+            "element_id": ledger.element_id,
+            "revision": ledger.response_id,
+            "step_id": message_id,
+        }
+        # Like a chat transcript, every pause asks in a new message below the
+        # answered reviews.
+        message = cl.Message(
+            id=message_id,
+            content=self._prompt(calls),
+            elements=[
+                cl.CustomElement(
+                    id=ledger.element_id,
+                    name=self._element_name,
+                    props={**self._review(calls), HITL_CONTROL_PROP: control},
+                )
+            ],
+        )
+        _set_ledger(message, ledger)
+        await message.send()
+        return PendingHitl(message, ledger)
 
 
-def _set_ledger_metadata(
-    message: cl.Message,
-    ledger: Mapping[str, object],
-    *,
-    metadata_key: str,
-) -> None:
+def _ledger(message: cl.Message) -> HitlLedger | None:
+    raw = (message.metadata or {}).get(HITL_LEDGER_METADATA_KEY)
+    return None if raw is None else HitlLedger.model_validate(raw)
+
+
+def _set_ledger(message: cl.Message, ledger: HitlLedger) -> None:
+    # The review's text stays out of model requests; its calls carry it.
     mark_model_context_excluded(message)
     message.metadata = {
         **(message.metadata or {}),
-        metadata_key: dict(ledger),
+        HITL_LEDGER_METADATA_KEY: ledger.model_dump(
+            mode="json", by_alias=True, exclude_none=True
+        ),
     }
 
 
@@ -411,8 +411,8 @@ def _normalize_chainlit_created_at(message: cl.Message) -> None:
 
 __all__ = [
     "HITL_CONTROL_PROP",
-    "HITL_ELEMENT_METADATA_KEY",
     "HITL_LEDGER_METADATA_KEY",
+    "HitlLedger",
     "HitlWorkflow",
     "InvalidHitlSubmissionError",
     "PendingHitl",

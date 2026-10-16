@@ -37,17 +37,18 @@ carrier = _call("carrier", question="Choose carrier")
 
 
 def test_form_presents_the_complete_batch_in_the_bundled_element() -> None:
+    # The prompts live only in the message; the element holds the controls.
     assert form.props([refund, carrier]) == {
         "reviews": [
-            {
-                "prompt": "Approve refund?",
-                "choices": ["approve", "reject"],
-                "allow_other": False,
-            },
-            {"prompt": "Choose carrier", "choices": [], "allow_other": True},
+            {"choices": ["approve", "reject"], "allow_other": False},
+            {"choices": [], "allow_other": True},
         ]
     }
     assert form.prompt([refund]) == "Approve refund?"
+    assert form.receipt(["approve"]) == "Answered: approve"
+    assert form.receipt(["approve", "Ground"]) == (
+        "Answered 2 requests:\n\n1. approve\n2. Ground"
+    )
     assert form.prompt([refund, carrier]) == (
         "Human review is required for 2 requests.\n\n"
         "1. Approve refund?\n\n2. Choose carrier"

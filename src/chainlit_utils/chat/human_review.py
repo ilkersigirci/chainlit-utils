@@ -11,10 +11,11 @@ HUMAN_REVIEW_ELEMENT_NAME = "HumanReview"
 
 @dataclass(frozen=True, slots=True)
 class HumanReview:
-    """One function call's request, as the `HumanReview` element shows it.
+    """One function call's request for a human answer.
 
-    The reviewer picks one of ``choices`` or, when ``allow_other`` is set or no
-    choices exist, writes a free-text answer.
+    The form's message shows ``prompt``; the `HumanReview` element below it lets
+    the reviewer pick one of ``choices`` or, when ``allow_other`` is set or no
+    choices exist, write a free-text answer.
     """
 
     prompt: str
@@ -46,12 +47,23 @@ class HumanReviewForm:
         )
         return f"Human review is required for {len(reviews)} requests.\n\n{prompts}"
 
+    def receipt(self, outputs: Sequence[str]) -> str:
+        """Return the line the answered message adds to record the answers."""
+        if len(outputs) == 1:
+            return f"Answered: {outputs[0]}"
+        answers = "\n".join(
+            f"{index}. {output}" for index, output in enumerate(outputs, 1)
+        )
+        return f"Answered {len(outputs)} requests:\n\n{answers}"
+
     def props(self, calls: Sequence[ResponseFunctionToolCall]) -> dict[str, object]:
-        """Return the element props for the complete call batch."""
+        """Return the element props for the complete call batch.
+
+        The prompts stay in the message, so the element holds only the controls.
+        """
         return {
             "reviews": [
                 {
-                    "prompt": review.prompt,
                     "choices": list(review.choices),
                     "allow_other": review.allow_other or not review.choices,
                 }

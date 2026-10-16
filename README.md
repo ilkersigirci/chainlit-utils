@@ -306,16 +306,19 @@ characters.
 
 ## Human-in-the-loop Responses
 
-`chainlit_utils.openai.hitl` validates and serializes exact Responses function-call
-batches. `HitlWorkflow` persists the continuation in a model-context-excluded
+`HitlWorkflow` persists each review's `HitlLedger`, the paused Response's exact
+function calls and, once answered, their outputs, in a model-context-excluded
 Chainlit message with a custom element. It then returns, so the pending review is
 ordinary persisted UI rather than a socket-bound ask coroutine.
 
 Configure one workflow with the application-owned tool and action names, a
-request callback, and a presentation. The bundled `HumanReview` element shows
-every pending call in one form; `HumanReviewForm` builds its props, prompt,
-and answer validation from a function that reads one call's payload. Serve the
-element with `serve_public_files()`:
+request callback, and a presentation. The message shows each pending call's
+prompt, and the bundled `HumanReview` element below it collects every answer in
+one form, numbering several calls to match the message's list. Once answered,
+the form goes away and the message stays in the thread; a `receipt` adds a
+record of the decision to it, such as `Answered: approve`. `HumanReviewForm`
+builds its props, prompt, receipt, and answer validation from a function that
+reads one call's payload. Serve the element with `serve_public_files()`:
 
 ```python
 import json
@@ -350,6 +353,7 @@ hitl = HitlWorkflow(
     element_name=HUMAN_REVIEW_ELEMENT_NAME,
     prompt=form.prompt,
     publish_final=publish_final,
+    receipt=form.receipt,
     review=form.props,
     validate_outputs=form.validate_outputs,
 )
@@ -361,40 +365,60 @@ async def submit_review(action: cl.Action):
 ```
 
 The reviewer picks one of a review's `choices` or, when `allow_other` is set or
-there are no choices, writes an answer. `submit_action` returns the element's
-reply: `{"ok": True}`, or `{"ok": False, "error": message}` for an invalid or
-stale submission, which the element shows. A failed continuation is also logged
-and reported in the chat. An application with its own element passes its name
-and callbacks instead; the element reads the `_chainlit_utils_hitl` prop and
-submits its `step_id`, `element_id`, and `revision` with the `outputs`.
+there are no choices, writes an answer. `submit_action` records the answers
+and replies at once: `{"ok": True}`, or `{"ok": False, "error": message}` for an
+invalid or stale submission, which the element shows. The continuation then
+runs as the session's task, like a chat message, so Chainlit shows it running
+and Stop cancels it. A failed continuation is logged and reported in the chat,
+and the review stays answered.
+
+**Cancel** closes the review instead, like Open WebUI's: the message records
+`Cancelled.`, the paused Response is left to the server's expiry, and later
+requests replay nothing of it.
+
+An application with its own element passes its name and callbacks instead; the
+element reads the `_chainlit_utils_hitl` prop and submits its `step_id`,
+`element_id`, and `revision` with the `outputs`, or with `cancel: true`.
 
 Call `await hitl.publish(response, model_id=model_id)` when the tool appears and
 `await hitl.block_new_message(message)` before starting a new request. The
 custom element submits its opaque step, element, and revision references through
 Chainlit's `callAction`; model IDs, response IDs, function calls, and the
 expected element ID are always read from trusted current-thread message
-metadata. Each accepted action advances one Responses transition. A later
-interrupt updates the same persisted form. Any other response marks the ledger
-complete, removes the form, and goes to `publish_final`, which renders the
-answer or runs the client function calls it contains.
+metadata. Each accepted answer is recorded in the review's ledger, then
+advances one Responses transition. A later interrupt asks in a new message,
+like a chat transcript; any other response goes to `publish_final`, which renders
+the answer or runs the client function calls it contains.
 
 Chainlit natively restores the message and custom element when a persisted
 thread is opened. No `on_chat_end` cancellation, `on_chat_resume` recreation,
-session task ownership, reconnect timer, or `user_session` HITL cache is needed.
-The application callbacks still own the API request, final rendering, payload
-schema, and client credentials.
+reconnect timer, or `user_session` HITL cache is needed. The application
+callbacks still own the API request, final rendering, payload schema, and client
+credentials.
 
 `HitlWorkflow` also normalizes the timestamp on a restored ledger message before
 updating it. Chainlit 2.12's official PostgreSQL layer hydrates `createdAt`
 without the trailing `Z` that its own update path requires; without this narrow
 compatibility fix, the UI can finish while the durable ledger remains pending.
 
-OpenAI continuations by ID require a stored prior Response. Stateless client-tool
-loops instead use `continuation_input` to replay every output item in order.
+OpenAI documents `previous_response_id` for stored responses and manual replay
+for `store: false`. Stateless client-tool loops use `continuation_input` to
+replay every output item in order.
 
-The ledger is strict and versioned. It rejects unknown fields, unexpected tool
-names, duplicate call IDs, and incomplete output batches instead of guessing at
-state that may no longer be safe to resume.
+Build later requests with `hitl.response_input()` instead of
+`response_input(text_only_chat_messages())`. Like any stateless Responses
+transcript, it replays each answered review as its function calls and outputs
+where it happened, so the model sees what was asked and answered; the review
+message's own text stays out. A review records its answers before its
+continuation runs, so a transcript built meanwhile, such as for client tools,
+includes it.
+
+The ledger is strict and versioned. It rejects unknown ledger fields, other
+schema versions, duplicate call IDs, outputs that do not answer every call, and
+outputs on a cancelled review instead of guessing at state that may no longer
+be safe to resume. Each call is stored as the OpenAI SDK's
+`ResponseFunctionToolCall`, which also keeps fields it does not define. A review
+cannot include other function calls.
 
 ## MCP tools
 
