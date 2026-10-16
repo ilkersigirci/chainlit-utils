@@ -25,17 +25,20 @@ export default function HumanReview() {
     )
   }
 
-  const ready =
-    reviews.length > 0 &&
-    responses.length === reviews.length &&
-    responses.every((response) => response.trim()) &&
+  const controlReady =
     typeof control.action === "string" &&
     typeof control.step_id === "string" &&
     typeof control.element_id === "string" &&
     typeof control.revision === "string"
+  const ready =
+    controlReady &&
+    reviews.length > 0 &&
+    responses.length === reviews.length &&
+    responses.every((response) => response.trim())
 
-  const submitResponses = async () => {
-    if (!ready || submitting) return
+  // The workflow records the review and removes this form before it replies.
+  const send = async (decision) => {
+    if (!controlReady || submitting) return
     setSubmitting(true)
     setError("")
     try {
@@ -45,7 +48,7 @@ export default function HumanReview() {
           step_id: control.step_id,
           element_id: control.element_id,
           revision: control.revision,
-          outputs: responses.map((response) => response.trim()),
+          ...decision,
         },
       })
       if (result?.response?.ok !== true) {
@@ -116,13 +119,23 @@ export default function HumanReview() {
         {error && <p className="text-sm text-destructive">{error}</p>}
       </CardContent>
 
-      <CardFooter className="justify-end">
+      <CardFooter className="justify-end gap-2">
         <Button
           type="button"
-          onClick={submitResponses}
+          variant="outline"
+          onClick={() => send({ cancel: true })}
+          disabled={!controlReady || submitting}
+        >
+          Cancel
+        </Button>
+        <Button
+          type="button"
+          onClick={() =>
+            send({ outputs: responses.map((response) => response.trim()) })
+          }
           disabled={!ready || submitting}
         >
-          {submitting ? "Submitting..." : "Submit"}
+          Submit
         </Button>
       </CardFooter>
     </Card>

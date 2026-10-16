@@ -127,13 +127,16 @@ def stored_ledger(message: cl.Message) -> hitl.HitlLedger:
     )
 
 
-def review_action(pending: hitl.PendingHitl, *outputs: str) -> cl.Action:
-    """Build the action the review element submits with these answers."""
+def review_action(
+    pending: hitl.PendingHitl, *outputs: str, cancel: bool = False
+) -> cl.Action:
+    """Build the action the review element submits: its answers, or a cancel."""
     review_control = control(pending)
     payload = {
         key: review_control[key] for key in ("step_id", "element_id", "revision")
     }
-    return cl.Action(name=ACTION_NAME, payload={**payload, "outputs": list(outputs)})
+    decision = {"cancel": True} if cancel else {"outputs": list(outputs)}
+    return cl.Action(name=ACTION_NAME, payload={**payload, **decision})
 
 
 async def answer(
@@ -200,7 +203,7 @@ async def test_new_user_turn_is_blocked_while_a_review_is_pending(
     }
     trigger.update.assert_awaited_once_with()
     notify.assert_awaited_once_with(
-        "Resolve the pending interrupt before starting another request."
+        "Answer or cancel the pending review before starting another request."
     )
 
 
@@ -301,6 +304,40 @@ async def test_later_requests_replay_answered_reviews_in_place(
     assert during_continuation == [
         [{"role": "user", "content": "Refund ORDER-123"}, call, output]
     ]
+
+
+async def test_cancel_closes_the_review_without_continuing(
+    chainlit_context,
+    removed_controls: list[str],
+) -> None:
+    instance, continue_response, publish_final = workflow()
+    await cl.Message(content="Refund ORDER-123", type="user_message").send()
+    pending = await instance.publish(
+        response("resp_one", function_call("one")), model_id="review-model"
+    )
+    assert pending is not None
+    action = review_action(pending, cancel=True)
+
+    reply = await instance.submit_action(action)
+
+    # Like a cancelled Open WebUI card, the review records it and the graph does
+    # not resume; the thread takes new messages, and nothing of it replays.
+    assert reply == {"ok": True}
+    assert pending.message.content == "Review 1 request(s).\n\nCancelled."
+    assert stored_ledger(pending.message).cancelled is True
+    assert removed_controls == [pending.ledger.element_id]
+    assert chainlit_context.session.current_task is None
+    continue_response.assert_not_awaited()
+    publish_final.assert_not_awaited()
+    trigger = SimpleNamespace(metadata={}, update=AsyncMock())
+    assert await instance.block_new_message(trigger) is False
+    assert instance.response_input() == [
+        {"role": "user", "content": "Refund ORDER-123"}
+    ]
+    assert await instance.submit_action(action) == {
+        "ok": False,
+        "error": "This human-review request is no longer pending.",
+    }
 
 
 async def test_client_function_calls_after_review_go_to_publish_final(
@@ -598,8 +635,15 @@ def test_stored_ledger_round_trips_the_exact_calls() -> None:
                 function_call("one").model_dump(),
             ]
         },
+        {"cancelled": True, "outputs": ["approve", "reject"]},
     ],
-    ids=["unknown-field", "other-version", "missing-output", "duplicate-call-id"],
+    ids=[
+        "unknown-field",
+        "other-version",
+        "missing-output",
+        "duplicate-call-id",
+        "cancelled-with-outputs",
+    ],
 )
 def test_stored_ledger_rejects_corrupt_state(corruption: dict[str, object]) -> None:
     ledger = {
@@ -622,8 +666,10 @@ def test_stored_ledger_rejects_corrupt_state(corruption: dict[str, object]) -> N
         ({"model_id": "browser-controlled"}, "Invalid human-review submission."),
         ({"outputs": "approve"}, "Invalid human-review submission."),
         ({"revision": "resp_old"}, "This human-review request is stale."),
+        ({"cancel": True}, "Invalid human-review submission."),
+        ({"outputs": None}, "Invalid human-review submission."),
     ],
-    ids=["extra-field", "text-outputs", "stale"],
+    ids=["extra-field", "text-outputs", "stale", "answer-and-cancel", "neither"],
 )
 async def test_submit_action_replies_with_the_error_the_element_shows(
     chainlit_context,

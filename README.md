@@ -370,25 +370,31 @@ and replies at once: `{"ok": True}`, or `{"ok": False, "error": message}` for an
 invalid or stale submission, which the element shows. The continuation then
 runs as the session's task, like a chat message, so Chainlit shows it running
 and Stop cancels it. A failed continuation is logged and reported in the chat,
-and the review stays answered. An application with its own element passes its
-name and callbacks instead; the element reads the `_chainlit_utils_hitl` prop
-and submits its `step_id`, `element_id`, and `revision` with the `outputs`.
+and the review stays answered.
+
+**Cancel** closes the review instead, like Open WebUI's: the message records
+`Cancelled.`, the paused Response is left to the server's expiry, and later
+requests replay nothing of it.
+
+An application with its own element passes its name and callbacks instead; the
+element reads the `_chainlit_utils_hitl` prop and submits its `step_id`,
+`element_id`, and `revision` with the `outputs`, or with `cancel: true`.
 
 Call `await hitl.publish(response, model_id=model_id)` when the tool appears and
 `await hitl.block_new_message(message)` before starting a new request. The
 custom element submits its opaque step, element, and revision references through
 Chainlit's `callAction`; model IDs, response IDs, function calls, and the
 expected element ID are always read from trusted current-thread message
-metadata. Each accepted action records the answers in the review's ledger,
-then advances one Responses transition. A later interrupt asks in a new message,
+metadata. Each accepted answer is recorded in the review's ledger, then
+advances one Responses transition. A later interrupt asks in a new message,
 like a chat transcript; any other response goes to `publish_final`, which renders
 the answer or runs the client function calls it contains.
 
 Chainlit natively restores the message and custom element when a persisted
 thread is opened. No `on_chat_end` cancellation, `on_chat_resume` recreation,
-reconnect timer, or `user_session` HITL cache is needed.
-The application callbacks still own the API request, final rendering, payload
-schema, and client credentials.
+reconnect timer, or `user_session` HITL cache is needed. The application
+callbacks still own the API request, final rendering, payload schema, and client
+credentials.
 
 `HitlWorkflow` also normalizes the timestamp on a restored ledger message before
 updating it. Chainlit 2.12's official PostgreSQL layer hydrates `createdAt`
@@ -408,10 +414,11 @@ continuation runs, so a transcript built meanwhile, such as for client tools,
 includes it.
 
 The ledger is strict and versioned. It rejects unknown ledger fields, other
-schema versions, duplicate call IDs, and outputs that do not answer every call
-instead of guessing at state that may no longer be safe to resume. Each call is
-stored as the OpenAI SDK's `ResponseFunctionToolCall`, which also keeps fields
-it does not define. A review cannot include other function calls.
+schema versions, duplicate call IDs, outputs that do not answer every call, and
+outputs on a cancelled review instead of guessing at state that may no longer
+be safe to resume. Each call is stored as the OpenAI SDK's
+`ResponseFunctionToolCall`, which also keeps fields it does not define. A review
+cannot include other function calls.
 
 ## MCP tools
 

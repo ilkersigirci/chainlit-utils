@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal, Protocol, Self
+from typing import Annotated, Any, Literal, Protocol, Self
 
 import chainlit as cl
 from openai.types.responses import Response, ResponseFunctionToolCall
@@ -34,7 +34,8 @@ class HitlLedger(BaseModel):
     """One review's paused function calls and, once answered, their outputs.
 
     The review message persists it, so a reload resumes the paused Response
-    and later requests replay the answered review.
+    and later requests replay the answered review. A cancelled review never
+    resumes and replays nothing.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -46,6 +47,7 @@ class HitlLedger(BaseModel):
     function_calls: tuple[ResponseFunctionToolCall, ...] = Field(min_length=1)
     # None until the review is answered.
     outputs: tuple[str, ...] | None = None
+    cancelled: bool = False
 
     @model_validator(mode="after")
     def _complete_batch(self) -> Self:
@@ -54,8 +56,15 @@ class HitlLedger(BaseModel):
         ):
             raise ValueError("HITL call IDs must be unique.")
         if self.outputs is not None:
+            if self.cancelled:
+                raise ValueError("A cancelled HITL review has no outputs.")
             self.output_items(self.outputs)
         return self
+
+    @property
+    def closed(self) -> bool:
+        """Whether the review was answered or cancelled."""
+        return self.outputs is not None or self.cancelled
 
     def call_items(self) -> list[dict[str, Any]]:
         """Return the function calls as Responses input items."""
@@ -82,7 +91,15 @@ class _Submission(BaseModel):
     step_id: str = Field(min_length=1)
     element_id: str = Field(min_length=1)
     revision: str = Field(min_length=1)
-    outputs: list[str] = Field(min_length=1)
+    # An answer for every call, or ``cancel`` to close the review without one.
+    outputs: Annotated[list[str], Field(min_length=1)] | None = None
+    cancel: bool = False
+
+    @model_validator(mode="after")
+    def _answer_or_cancel(self) -> Self:
+        if self.cancel == (self.outputs is not None):
+            raise ValueError("A submission answers or cancels the review.")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +199,7 @@ class HitlWorkflow:
         mark_model_context_excluded(trigger_message)
         await trigger_message.update()
         await send_ui_message(
-            "Resolve the pending interrupt before starting another request."
+            "Answer or cancel the pending review before starting another request."
         )
         return True
 
@@ -194,19 +211,30 @@ class HitlWorkflow:
         "error": message}``, which the element shows. The continuation then runs
         as the session's task, like a chat message: Chainlit shows it running
         and Stop cancels it. A failed continuation is logged and reported in the
-        chat.
+        chat. A cancelled review closes without a continuation.
         """
         try:
             submission = _Submission.model_validate(action.payload)
         except ValidationError:
             return {"ok": False, "error": "Invalid human-review submission."}
         try:
-            ledger, input_items = await self._record(**submission.model_dump())
+            pending = self._pending(
+                step_id=submission.step_id,
+                element_id=submission.element_id,
+                revision=submission.revision,
+            )
+            if submission.outputs is None:
+                # Like a cancelled Open WebUI card, the paused Response is left
+                # to the server's expiry.
+                cancelled = pending.ledger.model_copy(update={"cancelled": True})
+                await self._close(pending, cancelled, "Cancelled.")
+                return {"ok": True}
+            input_items = await self._record(pending, submission.outputs)
         except InvalidHitlSubmissionError as exc:
             return {"ok": False, "error": str(exc)}
         # Chainlit runs a chat message the same way; Stop cancels this task.
         cl.context.session.current_task = asyncio.create_task(
-            self._run(ledger, input_items)
+            self._run(pending.ledger, input_items)
         )
         return {"ok": True}
 
@@ -219,43 +247,40 @@ class HitlWorkflow:
         outputs: Sequence[str],
     ) -> PendingHitl | None:
         """Record a UI action's answers, then continue the paused Response."""
-        ledger, input_items = await self._record(
-            step_id=step_id,
-            element_id=element_id,
-            revision=revision,
-            outputs=outputs,
+        pending = self._pending(
+            step_id=step_id, element_id=element_id, revision=revision
         )
-        return await self._continue(ledger, input_items)
+        input_items = await self._record(pending, outputs)
+        return await self._continue(pending.ledger, input_items)
 
     def _current_pending(self) -> PendingHitl | None:
         for message in reversed(cl.chat_context.get()):
             ledger = _ledger(message)
             if ledger is not None:
-                return PendingHitl(message, ledger) if ledger.outputs is None else None
+                return None if ledger.closed else PendingHitl(message, ledger)
         return None
 
-    async def _record(
-        self,
-        *,
-        step_id: str,
-        element_id: str,
-        revision: str,
-        outputs: Sequence[str],
-    ) -> tuple[HitlLedger, list[dict[str, Any]]]:
-        # Nothing awaits before the answers are recorded, so a duplicate
-        # submission finds the review answered.
+    def _pending(self, *, step_id: str, element_id: str, revision: str) -> PendingHitl:
+        # Callers close the review before their first await, so a duplicate
+        # submission finds it closed.
         pending = self._current_pending()
         if pending is None:
             raise InvalidHitlSubmissionError(
                 "This human-review request is no longer pending."
             )
-        message, ledger = pending.message, pending.ledger
-        if (message.id, ledger.element_id, ledger.response_id) != (
+        ledger = pending.ledger
+        if (pending.message.id, ledger.element_id, ledger.response_id) != (
             step_id,
             element_id,
             revision,
         ):
             raise InvalidHitlSubmissionError("This human-review request is stale.")
+        return pending
+
+    async def _record(
+        self, pending: PendingHitl, outputs: Sequence[str]
+    ) -> list[dict[str, Any]]:
+        ledger = pending.ledger
         try:
             answers = tuple(
                 self._validate_outputs(ledger.function_calls, outputs)
@@ -265,12 +290,22 @@ class HitlWorkflow:
             input_items = ledger.output_items(answers)
         except (TypeError, ValueError) as exc:
             raise InvalidHitlSubmissionError(str(exc)) from exc
+        await self._close(
+            pending,
+            ledger.model_copy(update={"outputs": answers}),
+            self._receipt(answers) if self._receipt is not None else None,
+        )
+        return input_items
 
+    async def _close(
+        self, pending: PendingHitl, ledger: HitlLedger, record: str | None
+    ) -> None:
+        message = pending.message
         message.elements = []
-        if self._receipt is not None:
-            # The answered review keeps its request and records the decision.
-            message.content = f"{message.content}\n\n{self._receipt(answers)}"
-        _set_ledger(message, ledger.model_copy(update={"outputs": answers}))
+        if record is not None:
+            # The closed review keeps its request and records the outcome.
+            message.content = f"{message.content}\n\n{record}"
+        _set_ledger(message, ledger)
         _normalize_chainlit_created_at(message)
         await message.update()
         # A restored thread's message has no elements, so the control is
@@ -279,8 +314,7 @@ class HitlWorkflow:
         try:
             await control.remove()
         except Exception:
-            logger.exception("Failed to remove a completed HITL element")
-        return ledger, input_items
+            logger.exception("Failed to remove a closed HITL element")
 
     async def _continue(
         self, ledger: HitlLedger, input_items: list[dict[str, Any]]
