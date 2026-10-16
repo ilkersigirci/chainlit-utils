@@ -458,6 +458,42 @@ async def test_resumed_thread_continues_from_its_persisted_ledger(
     publish_final.assert_awaited_once_with(final)
 
 
+async def test_a_review_left_pending_by_a_lost_write_replays_nothing(
+    chainlit_context,
+) -> None:
+    transcripts: list[list[dict[str, object]]] = []
+    responses = [response("resp_two", function_call("two")), response("resp_final")]
+
+    async def continue_response(input_items, **_):
+        transcripts.append(instance.response_input(answers=input_items))
+        return responses.pop(0)
+
+    instance, _, _ = workflow(continue_response=continue_response)
+    user = await cl.Message(content="Refund ORDER-123", type="user_message").send()
+    first = await instance.publish(
+        response("resp_one", function_call("one")), model_id="review-model"
+    )
+    assert first is not None
+    unanswered = first.message.to_dict()
+    second = await answer(instance, first, "approve")
+    assert second is not None
+
+    # Chainlit writes in background tasks. After a reload that lost the first
+    # review's completion, both reviews are pending.
+    cl.chat_context.clear()
+    for step in (user.to_dict(), unanswered, second.message.to_dict()):
+        cl.chat_context.add(cl.Message.from_dict(step))
+
+    await answer(instance, second, "reject")
+
+    # The first review's answers are unknown, so only the second one replays.
+    assert transcripts[-1] == [
+        {"role": "user", "content": "Refund ORDER-123"},
+        function_call("two").model_dump(mode="json", exclude_none=True),
+        {"type": "function_call_output", "call_id": "call_two", "output": "reject"},
+    ]
+
+
 async def test_terminal_response_is_published_without_a_review(
     chainlit_context,
 ) -> None:

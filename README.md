@@ -405,10 +405,11 @@ message's own text stays out. While a continuation runs, pass the function
 outputs it submits as `answers`, so a transcript built for client tools then
 includes that review too.
 
-The ledger is strict and versioned. It rejects unknown fields, other schema
-versions, duplicate call IDs, and outputs that do not answer every call instead
-of guessing at state that may no longer be safe to resume. A review cannot
-include other function calls.
+The ledger is strict and versioned. It rejects unknown ledger fields, other
+schema versions, duplicate call IDs, and outputs that do not answer every call
+instead of guessing at state that may no longer be safe to resume. Each call is
+stored as the OpenAI SDK's `ResponseFunctionToolCall`, which also keeps fields
+it does not define. A review cannot include other function calls.
 
 ## MCP tools
 

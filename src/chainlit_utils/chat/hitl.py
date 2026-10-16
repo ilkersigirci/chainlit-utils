@@ -164,6 +164,9 @@ class HitlWorkflow:
         ``text_only_chat_messages``. While a continuation runs, pass the
         function outputs it submits as ``answers`` to replay that review too.
         """
+        # Answers belong to the review being continued; an earlier one left
+        # pending by a lost write has no known answers and replays nothing.
+        current = self._current_pending() if answers else None
         items: list[dict[str, Any]] = []
         for message, openai_message in zip(
             cl.chat_context.get(),
@@ -176,7 +179,7 @@ class HitlWorkflow:
                     items += response_input([openai_message])
             elif ledger.outputs is not None:
                 items += ledger.call_items() + ledger.output_items(ledger.outputs)
-            elif answers:
+            elif current is not None and message.id == current.message.id:
                 items += ledger.call_items() + [dict(answer) for answer in answers]
         return items
 
@@ -326,8 +329,9 @@ class HitlWorkflow:
             ],
         )
         _set_ledger(message, ledger)
-        # Persist the new ledger before completing the answered one, so the
-        # paused response always has one.
+        # Send the new review before completing the answered one. Chainlit
+        # writes both in background tasks; if the completion is lost, the
+        # latest review still decides what is pending.
         await message.send()
         return PendingHitl(message, ledger)
 
@@ -338,8 +342,9 @@ class HitlWorkflow:
             # The answered review keeps its request and records the decision.
             message.content = f"{message.content}\n\n{self._receipt(outputs)}"
         _set_ledger(message, answered.ledger.model_copy(update={"outputs": outputs}))
-        # Persist completion before rendering final output so a reconnect
-        # cannot replay the already-consumed continuation.
+        # Record the answers before the final output renders. Chainlit writes
+        # them in a background task, so a reload during a long answer finds
+        # the review answered.
         _normalize_chainlit_created_at(message)
         await message.update()
         # A restored thread's message has no elements, so the control is
