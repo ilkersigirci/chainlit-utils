@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from chainlit.session import WebsocketSession
 
 # Chainlit keeps message metadata, but not elements, when it resumes a thread.
+# The key holds the Responses parts of the message's uploads.
 FILE_IDS_METADATA_KEY = "chainlit_utils.file_ids"
 
 
@@ -37,17 +38,18 @@ async def with_response_file_parts(
     client: AsyncOpenAI,
     extra_query: Mapping[str, object] | None = None,
 ) -> list[dict[str, Any]]:
-    """Add the message's attachments as native Responses input-file parts.
+    """Add the message's attachments as native Responses input parts.
 
-    The first request uploads them and saves their file IDs on the message, so
-    an edited or resumed message sends the same files again.
+    Raster images become ``input_image`` parts and other files ``input_file``
+    parts. The first request uploads them and saves their parts on the message,
+    so an edited or resumed message sends the same files again.
     """
-    file_ids = await _message_file_ids(
+    file_parts = await _message_file_parts(
         message,
         client=client,
         extra_query=extra_query,
     )
-    if not file_ids:
+    if not file_parts:
         return input_items
 
     user_message_index = next(
@@ -58,7 +60,6 @@ async def with_response_file_parts(
         ),
         None,
     )
-    file_parts = [{"type": "input_file", "file_id": file_id} for file_id in file_ids]
     if user_message_index is None:
         return [*input_items, {"role": "user", "content": file_parts}]
 
@@ -80,23 +81,29 @@ async def with_response_file_parts(
     ]
 
 
-async def _message_file_ids(
+async def _message_file_parts(
     message: cl.Message,
     *,
     client: AsyncOpenAI,
     extra_query: Mapping[str, object] | None,
-) -> list[str]:
+) -> list[dict[str, str]]:
     metadata = message.metadata or {}
-    saved_file_ids = metadata.get(FILE_IDS_METADATA_KEY)
-    if not saved_file_ids and not message.elements:
+    saved_parts = metadata.get(FILE_IDS_METADATA_KEY)
+    if not saved_parts and not message.elements:
         return []
     if not session_file_upload_enabled():
         raise ValueError("The selected chat profile does not support file inputs.")
 
-    if saved_file_ids:
-        return list(saved_file_ids)
+    if saved_parts:
+        # Messages saved before image parts hold bare IDs, all sent as files.
+        return [
+            {"type": "input_file", "file_id": part}
+            if isinstance(part, str)
+            else dict(part)
+            for part in saved_parts
+        ]
 
-    file_ids = []
+    file_parts = []
     for element in message.elements:
         path = getattr(element, "path", None)
         if not isinstance(path, str) or not path:
@@ -109,11 +116,20 @@ async def _message_file_ids(
                 purpose="user_data",
                 extra_query=extra_query,
             )
-        file_ids.append(uploaded.id)
-    if file_ids:
-        message.metadata = {**metadata, FILE_IDS_METADATA_KEY: file_ids}
+        file_parts.append(_input_part(uploaded.id, content_type))
+    if file_parts:
+        message.metadata = {**metadata, FILE_IDS_METADATA_KEY: file_parts}
         await message.update()
-    return file_ids
+    return file_parts
+
+
+def _input_part(file_id: str, content_type: str) -> dict[str, str]:
+    """Return the Responses part for an uploaded file's media type."""
+    media_type = content_type.partition(";")[0].strip().lower()
+    # Models see raster images as pixels; an SVG image is XML.
+    if media_type.startswith("image/") and media_type != "image/svg+xml":
+        return {"type": "input_image", "file_id": file_id, "detail": "auto"}
+    return {"type": "input_file", "file_id": file_id}
 
 
 def session_file_upload_enabled() -> bool:
